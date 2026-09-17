@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS cycle_shares (
   actual_luna INTEGER,
   tx_hash TEXT,
   ok INTEGER,
+  reason TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (cycle_id, staker_address)
 );
 
@@ -95,6 +96,19 @@ class DB:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        self.conn.commit()
+        self._migrate()
+
+    def _migrate(self):
+        cols = {
+            r["name"] for r in self.conn.execute(
+                "PRAGMA table_info(cycle_shares)"
+            ).fetchall()
+        }
+        if "reason" not in cols:
+            self.conn.execute(
+                "ALTER TABLE cycle_shares ADD COLUMN reason TEXT NOT NULL DEFAULT ''"
+            )
         self.conn.commit()
 
     def close(self):
@@ -159,6 +173,46 @@ class DB:
             (validator, address, at_ms),
         ).fetchone()
         return row
+
+    def staker_balance_at(self, validator, address, at_or_before_ms):
+        """Last snapshot balance for (validator, address) at or before
+        at_or_before_ms, or None."""
+        row = self.conn.execute(
+            "SELECT balance_luna FROM staker_snapshots WHERE validator=? AND address=? "
+            "AND fetched_at_ms <= ? ORDER BY fetched_at_ms DESC LIMIT 1",
+            (validator, address, at_or_before_ms),
+        ).fetchone()
+        return int(row["balance_luna"]) if row else None
+
+    def staker_balance_after(self, validator, address, after_ms):
+        """First snapshot balance for (validator, address) strictly after
+        after_ms, or None."""
+        row = self.conn.execute(
+            "SELECT balance_luna FROM staker_snapshots WHERE validator=? AND address=? "
+            "AND fetched_at_ms > ? ORDER BY fetched_at_ms ASC LIMIT 1",
+            (validator, address, after_ms),
+        ).fetchone()
+        return int(row["balance_luna"]) if row else None
+
+    def staker_addresses_at(self, validator, at_or_before_ms):
+        """Set of staker addresses present (snapshotted) at or before
+        at_or_before_ms."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT address FROM staker_snapshots WHERE validator=? "
+            "AND fetched_at_ms <= ?",
+            (validator, at_or_before_ms),
+        ).fetchall()
+        return {r["address"] for r in rows}
+
+    def staker_addresses_after(self, validator, after_ms):
+        """Set of staker addresses present (snapshotted) strictly after
+        after_ms."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT address FROM staker_snapshots WHERE validator=? "
+            "AND fetched_at_ms > ?",
+            (validator, after_ms),
+        ).fetchall()
+        return {r["address"] for r in rows}
 
     def latest_staker_rows(self, validator):
         """Latest snapshot per staker address, ordered by balance desc."""
@@ -262,12 +316,13 @@ class DB:
     # ---- cycle shares ----
 
     def upsert_cycle_share(self, cycle_id, staker_address, expected_luna,
-                           actual_luna, tx_hash, ok):
+                           actual_luna, tx_hash, ok, reason=""):
         self.conn.execute(
             "INSERT OR REPLACE INTO cycle_shares "
-            "(cycle_id, staker_address, expected_luna, actual_luna, tx_hash, ok) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (cycle_id, staker_address, expected_luna, actual_luna, tx_hash, ok),
+            "(cycle_id, staker_address, expected_luna, actual_luna, tx_hash, ok, reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (cycle_id, staker_address, expected_luna, actual_luna, tx_hash,
+             ok, reason),
         )
         self.conn.commit()
 

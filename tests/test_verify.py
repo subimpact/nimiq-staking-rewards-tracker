@@ -1,7 +1,12 @@
 """End-to-end tests for the verify (G2) job against a fake RPC server.
 
-Covers a fully VERIFIED cycle with 3 stakers and a MISMATCH cycle, plus the
-integer-luna expected-share math, dust floor and rounding tolerance from SPEC.
+Covers a fully VERIFIED cycle with 3 stakers, a MISMATCH cycle, the integer-luna
+expected-share math, dust floor, rounding tolerance, the insufficient-snapshot
+PENDING guard, and the unaccounted-restake-value consistency check.
+
+Credit attribution is Option A: a staker's actual credit is the active-balance
+delta between the snapshot at/before the window opened and the first snapshot
+strictly after the window opened.
 """
 
 import os
@@ -19,7 +24,7 @@ from tests.fake_rpc import (
     STAKER_C,
     VALIDATOR,
     coinbase_tx,
-    restake_tx,
+    staking_tx,
     staker_row,
 )
 
@@ -27,6 +32,12 @@ TOTAL_LUNA = 100000000      # 1000 NIM total validator stake
 RESERVE = 100000            # RESERVE_LUNA default
 COINBASE_AMOUNT = 2000000   # 20 NIM block reward
 MIN_SHARE = 500             # MIN_SHARE_LUNA default
+AVAILABLE = COINBASE_AMOUNT - RESERVE  # 1900000
+
+# Expected shares for open balances A=40M, B=30M, C=30M.
+EXP_A = (40000000 * AVAILABLE) // TOTAL_LUNA  # 760000
+EXP_B = (30000000 * AVAILABLE) // TOTAL_LUNA  # 570000
+EXP_C = (30000000 * AVAILABLE) // TOTAL_LUNA  # 570000
 
 
 def build_config(fake):
@@ -47,11 +58,6 @@ def build_config(fake):
 
 def base_env():
     fake = FakeServer()
-    fake.set_stakers([
-        staker_row(STAKER_A, 40000000),
-        staker_row(STAKER_B, 30000000),
-        staker_row(STAKER_C, 30000000),
-    ])
     fake.set_validator(TOTAL_LUNA, 3)
     cfg = build_config(fake)
     db = DB(os.path.join(fake.data_dir, "tracker.db"))
@@ -70,20 +76,10 @@ class _FakeFetcher:
         return self.fake.txs(address)
 
     def get_stakers(self):
-        return self.fake.stakers_payload
+        return self.fake.stakers_payload_now()
 
     def get_validators(self):
         return self.fake.validators_payload
-
-
-def run_two_pass(jobs):
-    """Run all four jobs twice so a staged fixture's coinbase is followed by a
-    closing restake batch."""
-    for _ in range(2):
-        jobs.run_snapshot()
-        jobs.run_ingest()
-        jobs.run_cycle_close()
-        jobs.run_verify()
 
 
 def run_pass(jobs):
@@ -93,58 +89,78 @@ def run_pass(jobs):
     jobs.run_verify()
 
 
-def verified_fixture_txs(c_actual=None):
-    """Staged fixture: pass 1 earns a coinbase, pass 2 adds the closing
-    restake batch that distributes the previous window's reward."""
-    if c_actual is None:
-        c_actual = 570000
-    return [
-        [coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0")],
-        [
-            restake_tx(100, STAKER_A, 760000, "tx-a"),
-            restake_tx(100, STAKER_B, 570000, "tx-b"),
-            restake_tx(100, STAKER_C, c_actual, "tx-c"),
-        ],
-    ]
+def run_two_pass(jobs):
+    """Pass 1 snapshots the open balances + earns a coinbase; pass 2 snapshots
+    the close balances + adds the closing restake batch."""
+    run_pass(jobs)
+    run_pass(jobs)
+
+
+def stage_open_close(fake, open_rows, close_rows):
+    fake.set_staged_stakers([open_rows, close_rows])
+
+
+def closed_cycle(db):
+    return [c for c in db.recent_cycles(VALIDATOR, 10)
+            if c["status"] != "PENDING"]
+
+
+def closing_restakes(amounts):
+    """Closing restake batch: all AddStake txs to the staking contract."""
+    return [staking_tx(100, v, "tx-%d" % i) for i, v in enumerate(amounts)]
 
 
 class VerifyTest(unittest.TestCase):
     def test_verified_cycle_three_stakers(self):
         fake, db, cfg, jobs = base_env()
         try:
-            fake.set_staged_txs(verified_fixture_txs())
+            stage_open_close(
+                fake,
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                    staker_row(STAKER_C, 30000000),
+                ],
+                [
+                    staker_row(STAKER_A, 40000000 + EXP_A),
+                    staker_row(STAKER_B, 30000000 + EXP_B),
+                    staker_row(STAKER_C, 30000000 + EXP_C),
+                ],
+            )
+            fake.set_staged_txs([
+                [coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0")],
+                closing_restakes([EXP_A, EXP_B, EXP_C]),
+            ])
             run_two_pass(jobs)
 
-            cycles = db.recent_cycles(VALIDATOR, 10)
-            closed = [c for c in cycles if c["status"] != "PENDING"]
-            self.assertEqual(len(closed), 1)
-            cycle = closed[0]
+            cycles = closed_cycle(db)
+            self.assertEqual(len(cycles), 1)
+            cycle = cycles[0]
             self.assertEqual(cycle["status"], "VERIFIED")
-            self.assertEqual(cycle["available_luna"], COINBASE_AMOUNT - RESERVE)
+            self.assertEqual(cycle["available_luna"], AVAILABLE)
 
             shares = db.cycle_shares(cycle["id"])
             self.assertEqual(len(shares), 3)
             by_addr = {s["staker_address"]: s for s in shares}
 
-            self.assertEqual(by_addr[STAKER_A]["expected_luna"], 760000)
-            self.assertEqual(by_addr[STAKER_A]["actual_luna"], 760000)
+            self.assertEqual(by_addr[STAKER_A]["expected_luna"], EXP_A)
+            self.assertEqual(by_addr[STAKER_A]["actual_luna"], EXP_A)
             self.assertEqual(by_addr[STAKER_A]["ok"], 1)
-
-            self.assertEqual(by_addr[STAKER_B]["expected_luna"], 570000)
+            self.assertEqual(by_addr[STAKER_B]["actual_luna"], EXP_B)
             self.assertEqual(by_addr[STAKER_B]["ok"], 1)
-            self.assertEqual(by_addr[STAKER_C]["expected_luna"], 570000)
+            self.assertEqual(by_addr[STAKER_C]["actual_luna"], EXP_C)
             self.assertEqual(by_addr[STAKER_C]["ok"], 1)
+            self.assertEqual(sum(s["expected_luna"] for s in shares), AVAILABLE)
 
-            # Sum of expected equals available exactly (no dust here).
-            total_expected = sum(
-                s["expected_luna"] for s in shares
-            )
-            self.assertEqual(total_expected, cycle["available_luna"])
-
-            # G1 ledger populated for verified stakers.
+            # G1 ledger populated for verified stakers, credited with the
+            # boundary batch hash.
+            boundary = db.first_restake_after(VALIDATOR, 0)
+            batch_hash = boundary["tx_hash"]
             for addr in (STAKER_A, STAKER_B, STAKER_C):
                 rewards = db.staker_rewards(VALIDATOR, addr, 50)
                 self.assertEqual(len(rewards), 1)
+                self.assertEqual(rewards[0]["tx_hash"], batch_hash)
+                self.assertEqual(rewards[0]["block"], cycle["closed_block"])
         finally:
             db.close()
             fake.close()
@@ -152,22 +168,39 @@ class VerifyTest(unittest.TestCase):
     def test_mismatch_cycle(self):
         fake, db, cfg, jobs = base_env()
         try:
-            # C's restake is short by 5000 lunas -> mismatch on C only.
-            fake.set_staged_txs(verified_fixture_txs(c_actual=565000))
+            # C's close balance exceeds expected by 5000 -> ok=False.
+            c_close = 30000000 + EXP_C + 5000
+            stage_open_close(
+                fake,
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                    staker_row(STAKER_C, 30000000),
+                ],
+                [
+                    staker_row(STAKER_A, 40000000 + EXP_A),
+                    staker_row(STAKER_B, 30000000 + EXP_B),
+                    staker_row(STAKER_C, c_close),
+                ],
+            )
+            fake.set_staged_txs([
+                [coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0")],
+                closing_restakes([EXP_A, EXP_B, EXP_C + 5000]),
+            ])
             run_two_pass(jobs)
 
-            cycles = db.recent_cycles(VALIDATOR, 10)
-            closed = [c for c in cycles if c["status"] != "PENDING"]
-            cycle = closed[0]
+            cycles = closed_cycle(db)
+            cycle = cycles[0]
             self.assertEqual(cycle["status"], "MISMATCH")
 
-            shares = db.cycle_shares(cycle["id"])
-            by_addr = {s["staker_address"]: s for s in shares}
+            by_addr = {s["staker_address"]: s
+                       for s in db.cycle_shares(cycle["id"])}
             self.assertEqual(by_addr[STAKER_A]["ok"], 1)
             self.assertEqual(by_addr[STAKER_B]["ok"], 1)
             self.assertEqual(by_addr[STAKER_C]["ok"], 0)
-            self.assertEqual(by_addr[STAKER_C]["expected_luna"], 570000)
-            self.assertEqual(by_addr[STAKER_C]["actual_luna"], 565000)
+            self.assertEqual(by_addr[STAKER_C]["actual_luna"], EXP_C + 5000)
+            self.assertIn("credit exceeds expected share",
+                          by_addr[STAKER_C]["reason"])
 
             # Mismatched staker must NOT be credited to the G1 ledger.
             self.assertEqual(len(db.staker_rewards(VALIDATOR, STAKER_C, 50)), 0)
@@ -180,32 +213,33 @@ class VerifyTest(unittest.TestCase):
         fake, db, cfg, jobs = base_env()
         try:
             # Balance that produces a fractional expected share to prove floor.
-            fake.set_stakers([
-                staker_row(STAKER_A, 99999999),
-                staker_row(STAKER_B, 1),
-            ])
             fake.set_validator(100000000, 2)
-            # available = 2000000 - 100000 = 1900000
-            # A expected = floor(99999999*1900000/100000000)
-            expected_a = (99999999 * 1900000) // 100000000
-            expected_b = (1 * 1900000) // 100000000
+            expected_a = (99999999 * AVAILABLE) // 100000000
+            expected_b = (1 * AVAILABLE) // 100000000
             self.assertEqual(expected_a, 1899999)
             self.assertEqual(expected_b, 0)
 
+            stage_open_close(
+                fake,
+                [
+                    staker_row(STAKER_A, 99999999),
+                    staker_row(STAKER_B, 1),
+                ],
+                [
+                    staker_row(STAKER_A, 99999999 + expected_a),
+                    staker_row(STAKER_B, 1 + expected_b),
+                ],
+            )
             fake.set_staged_txs([
                 [coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0")],
-                [
-                    restake_tx(100, STAKER_A, expected_a, "tx-a"),
-                    restake_tx(100, STAKER_B, 0, "tx-b"),
-                ],
+                closing_restakes([expected_a, expected_b]),
             ])
             run_two_pass(jobs)
 
-            cycles = [c for c in db.recent_cycles(VALIDATOR, 10)
-                      if c["status"] != "PENDING"]
+            cycles = closed_cycle(db)
             cycle = cycles[0]
-            shares = db.cycle_shares(cycle["id"])
-            by_addr = {s["staker_address"]: s for s in shares}
+            by_addr = {s["staker_address"]: s
+                       for s in db.cycle_shares(cycle["id"])}
             self.assertEqual(by_addr[STAKER_A]["expected_luna"], expected_a)
             # B's expected (0) is below MIN_SHARE and actual is 0 -> dust ok.
             self.assertEqual(by_addr[STAKER_B]["expected_luna"], 0)
@@ -219,22 +253,95 @@ class VerifyTest(unittest.TestCase):
     def test_rounding_tolerance_plus_minus_one(self):
         fake, db, cfg, jobs = base_env()
         try:
-            # actual == expected + 1 is still OK (rounding tolerance).
+            # actual == expected +- 1 is still OK (rounding tolerance).
+            stage_open_close(
+                fake,
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                    staker_row(STAKER_C, 30000000),
+                ],
+                [
+                    staker_row(STAKER_A, 40000000 + EXP_A + 1),
+                    staker_row(STAKER_B, 30000000 + EXP_B - 1),
+                    staker_row(STAKER_C, 30000000 + EXP_C),
+                ],
+            )
             fake.set_staged_txs([
                 [coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0")],
-                [
-                    restake_tx(100, STAKER_A, 760001, "tx-a"),   # +1
-                    restake_tx(100, STAKER_B, 569999, "tx-b"),   # -1
-                    restake_tx(100, STAKER_C, 570000, "tx-c"),
-                ],
+                closing_restakes([EXP_A + 1, EXP_B - 1, EXP_C]),
             ])
             run_two_pass(jobs)
-            cycles = [c for c in db.recent_cycles(VALIDATOR, 10)
-                      if c["status"] != "PENDING"]
+
+            cycles = closed_cycle(db)
             cycle = cycles[0]
             self.assertEqual(cycle["status"], "VERIFIED")
             shares = db.cycle_shares(cycle["id"])
             self.assertTrue(all(s["ok"] == 1 for s in shares))
+        finally:
+            db.close()
+            fake.close()
+
+    def test_insufficient_snapshots_stays_pending(self):
+        fake, db, cfg, jobs = base_env()
+        try:
+            # Only open balances staged: no snapshot strictly after the window
+            # opened -> the cycle must remain PENDING.
+            fake.set_staged_stakers([
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                ],
+            ])
+            fake.set_staged_txs([
+                [coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0")],
+                closing_restakes([EXP_A, EXP_B]),
+            ])
+            run_two_pass(jobs)
+
+            cycles = db.recent_cycles(VALIDATOR, 10)
+            self.assertTrue(cycles)
+            self.assertEqual(len(closed_cycle(db)), 0)
+            self.assertTrue(all(c["status"] == "PENDING" for c in cycles))
+        finally:
+            db.close()
+            fake.close()
+
+    def test_unaccounted_restake_value(self):
+        fake, db, cfg, jobs = base_env()
+        try:
+            # All stakers match expected, but the on-chain restake value exceeds
+            # the attributed deltas by > 1 luna -> MISMATCH via drift.
+            extra = 10000
+            stage_open_close(
+                fake,
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                    staker_row(STAKER_C, 30000000),
+                ],
+                [
+                    staker_row(STAKER_A, 40000000 + EXP_A),
+                    staker_row(STAKER_B, 30000000 + EXP_B),
+                    staker_row(STAKER_C, 30000000 + EXP_C),
+                ],
+            )
+            fake.set_staged_txs([
+                [coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0")],
+                closing_restakes([EXP_A, EXP_B, EXP_C, extra]),
+            ])
+            run_two_pass(jobs)
+
+            cycles = closed_cycle(db)
+            cycle = cycles[0]
+            self.assertEqual(cycle["status"], "MISMATCH")
+            # Per-staker all ok; the drift surfaces on the shares' reason.
+            shares = db.cycle_shares(cycle["id"])
+            self.assertTrue(all(s["ok"] == 1 for s in shares))
+            self.assertTrue(all(
+                s["reason"] == "unaccounted restake value (possible timing drift)"
+                for s in shares
+            ))
         finally:
             db.close()
             fake.close()

@@ -18,7 +18,7 @@ import json
 import time
 import urllib.request
 
-from tracker.config import STAKING_CONTRACT_ADDR, COINBASE_ADDR
+from tracker.config import COINBASE_ADDR
 
 MAX_TX_BATCH = 200
 
@@ -114,18 +114,6 @@ class Jobs:
     def _latest_validator_total(self):
         row = self.db.latest_validator_snapshot(self.cfg.validator_addr)
         return int(row["total_luna"]) if row else 0
-
-    def _stakers_at(self, at_ms):
-        """Map staker address -> snapshot balance for the window-open moment."""
-        rows = self.db.latest_staker_rows(self.cfg.validator_addr)
-        out = {}
-        for r in rows:
-            snap = self.db.staker_snapshot_at(
-                self.cfg.validator_addr, r["address"], at_ms
-            )
-            if snap is not None:
-                out[snap["address"]] = int(snap["balance_luna"])
-        return out
 
     # ------------------------------------------------------------------- job 1
 
@@ -241,42 +229,116 @@ class Jobs:
 
         total = int(pending["total_luna"]) or 1
         opened_at_ms = int(pending["opened_at_ms"])
-        stakers = self._stakers_at(opened_at_ms)
+        boundary_hash = ""
+        boundary = self.db.first_restake_after(self.cfg.validator_addr, opened_block)
+        if boundary is not None:
+            boundary_hash = boundary["tx_hash"]
 
-        # actual per staker from window restakes (non-contract destinations).
-        actual_map = {}
-        tx_map = {}
-        for r in window:
-            to = r["to_addr"]
-            if to == STAKING_CONTRACT_ADDR:
-                continue
-            actual_map[to] = actual_map.get(to, 0) + int(r["amount_luna"])
-            tx_map.setdefault(to, r["tx_hash"])
-
-        all_ok = True
-        for addr, balance in stakers.items():
-            expected = (balance * available) // total
-            actual = actual_map.get(addr, 0)
-            ok = _is_ok(expected, actual, self.cfg.min_share_luna)
-            all_ok = all_ok and ok
-            self.db.upsert_cycle_share(
-                pending["id"], addr, expected, actual, tx_map.get(addr, ""),
-                1 if ok else 0,
-            )
-
-        status = "VERIFIED" if all_ok else "MISMATCH"
-        self.db.close_cycle(
-            pending["id"], closed_block, self._now_ms(), available, held, status
+        # Option A attribution: active balances only change via AddStake, so a
+        # staker's credit is the active-balance delta between the snapshot
+        # at/before the window opened and the first snapshot strictly after.
+        open_addrs = self.db.staker_addresses_at(self.cfg.validator_addr, opened_at_ms)
+        close_addrs = self.db.staker_addresses_after(
+            self.cfg.validator_addr, opened_at_ms
         )
 
-        # G1 ledger: credited amounts for this cycle.
+        # Guard 1: every staker present at open needs a snapshot strictly after
+        # the cycle opened; otherwise the window cannot be attributed.
+        for addr in open_addrs:
+            if self.db.staker_balance_after(
+                self.cfg.validator_addr, addr, opened_at_ms
+            ) is None:
+                # Insufficient snapshots; leave the cycle PENDING.
+                return
+
+        unaccounted = 0
+        reason_map = {}
+        actual_map = {}
+        for addr in open_addrs:
+            open_bal = self.db.staker_balance_at(
+                self.cfg.validator_addr, addr, opened_at_ms
+            ) or 0
+            close_bal = self.db.staker_balance_after(
+                self.cfg.validator_addr, addr, opened_at_ms
+            )
+            delta = close_bal - open_bal
+            actual_map[addr] = delta
+            if delta < 0:
+                # Guard 2: active balance decreased (unstake).
+                unaccounted += -delta
+                reason_map[addr] = "unstaked during cycle"
+
+        # Guard 3: new stakers that appear mid-cycle have no open balance and
+        # cannot be attributed; count their window credit as unaccounted.
+        for addr in close_addrs - open_addrs:
+            close_bal = self.db.staker_balance_after(
+                self.cfg.validator_addr, addr, opened_at_ms
+            )
+            unaccounted += close_bal or 0
+
+        all_ok = True
+        sum_delta = 0
+        expected_total = 0
+        for addr in open_addrs:
+            balance = self.db.staker_balance_at(
+                self.cfg.validator_addr, addr, opened_at_ms
+            ) or 0
+            expected = (balance * available) // total
+            expected_total += expected
+            actual = actual_map[addr]
+            sum_delta += actual
+
+            if addr in reason_map:
+                ok = False
+                reason = reason_map[addr]
+            elif actual > expected + 1:
+                # Guard 5: credit exceeds expected share.
+                ok = False
+                reason = "credit exceeds expected share (possible external top-up)"
+            else:
+                ok = _is_ok(expected, actual, self.cfg.min_share_luna)
+                reason = ""
+            all_ok = all_ok and ok
+            self.db.upsert_cycle_share(
+                pending["id"], addr, expected, actual, boundary_hash,
+                1 if ok else 0, reason,
+            )
+
+        # Guard 4: self-consistency check against the on-chain restake value.
+        sum_txs = _sum_ints(r["amount_luna"] for r in window)
+        drift = abs(sum_txs - (sum_delta + unaccounted)) > 1
+        if drift:
+            status = "MISMATCH"
+        else:
+            status = "VERIFIED" if all_ok else "MISMATCH"
+
+        closed_at_ms = self._now_ms()
+        self.db.close_cycle(
+            pending["id"], closed_block, closed_at_ms, available, held, status
+        )
+
+        # Surface the drift reason on shares that have none yet.
+        if drift:
+            drift_reason = "unaccounted restake value (possible timing drift)"
+            for share in self.db.cycle_shares(pending["id"]):
+                if share["reason"]:
+                    continue
+                self.db.upsert_cycle_share(
+                    pending["id"], share["staker_address"],
+                    share["expected_luna"], share["actual_luna"],
+                    share["tx_hash"], share["ok"], drift_reason,
+                )
+
+        # G1 ledger (guard 7): credited amounts for ok stakers. The AddStake
+        # payload cannot be decoded without raw txs, so the boundary batch hash
+        # stands in for the credit's tx_hash.
         for share in self.db.cycle_shares(pending["id"]):
             if not share["ok"]:
                 continue
             credited = int(share["actual_luna"])
             self.db.upsert_staker_reward(
-                share["staker_address"], closed_block, credited, share["tx_hash"],
-                self._now_ms(),
+                share["staker_address"], closed_block, credited,
+                boundary_hash, closed_at_ms,
             )
 
         self._open_pending_cycle()
