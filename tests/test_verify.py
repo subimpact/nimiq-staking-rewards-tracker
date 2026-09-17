@@ -22,6 +22,7 @@ from tests.fake_rpc import (
     STAKER_A,
     STAKER_B,
     STAKER_C,
+    STAKER_D,
     VALIDATOR,
     coinbase_tx,
     spread_staking_txs,
@@ -30,15 +31,16 @@ from tests.fake_rpc import (
 )
 
 TOTAL_LUNA = 100000000      # 1000 NIM total validator stake
-RESERVE = 100000            # RESERVE_LUNA default
+RESERVE = 100000            # RESERVE_LUNA default (wallet floor, NOT subtracted)
 COINBASE_AMOUNT = 2000000   # 20 NIM block reward
 MIN_SHARE = 500             # MIN_SHARE_LUNA default
-AVAILABLE = COINBASE_AMOUNT - RESERVE  # 1900000
+DUST_TOLERANCE = 500        # DUST_TOLERANCE_LUNA default
+AVAILABLE = COINBASE_AMOUNT  # full coinbase sum; no reserve carve
 
 # Expected shares for open balances A=40M, B=30M, C=30M.
-EXP_A = (40000000 * AVAILABLE) // TOTAL_LUNA  # 760000
-EXP_B = (30000000 * AVAILABLE) // TOTAL_LUNA  # 570000
-EXP_C = (30000000 * AVAILABLE) // TOTAL_LUNA  # 570000
+EXP_A = (40000000 * AVAILABLE) // TOTAL_LUNA  # 800000
+EXP_B = (30000000 * AVAILABLE) // TOTAL_LUNA  # 600000
+EXP_C = (30000000 * AVAILABLE) // TOTAL_LUNA  # 600000
 
 
 def build_config(fake):
@@ -88,7 +90,7 @@ class _FakeFetcher:
         return self.fake.stakers_payload_now()
 
     def get_validators(self):
-        return self.fake.validators_payload
+        return self.fake.validators_payload_now()
 
 
 def run_pass(jobs):
@@ -225,7 +227,7 @@ class VerifyTest(unittest.TestCase):
             fake.set_validator(100000000, 2)
             expected_a = (99999999 * AVAILABLE) // 100000000
             expected_b = (1 * AVAILABLE) // 100000000
-            self.assertEqual(expected_a, 1899999)
+            self.assertEqual(expected_a, 1999999)
             self.assertEqual(expected_b, 0)
 
             stage_open_close(
@@ -356,6 +358,88 @@ class VerifyTest(unittest.TestCase):
             fake.close()
 
 
+    def test_skim_detected(self):
+        # The bot distributes only 1,700,000 of a 2,000,000 coinbase, but the
+        # batch deltas match that batch proportionally (all stakers internally
+        # consistent). Guard 4a (drift) passes; guard 4b (honesty vs the cycle's
+        # reward income) fires -> MISMATCH with the skim reason on every share.
+        fake, db, cfg, jobs = base_env()
+        try:
+            skim_batch_total = 1700000
+            s_a = (40000000 * skim_batch_total) // TOTAL_LUNA
+            s_b = (30000000 * skim_batch_total) // TOTAL_LUNA
+            s_c = (30000000 * skim_batch_total) // TOTAL_LUNA
+            stage_open_close(
+                fake,
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                    staker_row(STAKER_C, 30000000),
+                ],
+                [
+                    staker_row(STAKER_A, 40000000 + s_a),
+                    staker_row(STAKER_B, 30000000 + s_b),
+                    staker_row(STAKER_C, 30000000 + s_c),
+                ],
+            )
+            fake.set_staged_txs([
+                [coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0")],
+                closing_restakes([s_a, s_b, s_c]),
+            ])
+            run_two_pass(jobs)
+
+            cycles = closed_cycle(db)
+            cycle = cycles[0]
+            self.assertEqual(cycle["status"], "MISMATCH")
+            shares = db.cycle_shares(cycle["id"])
+            self.assertTrue(all(
+                s["reason"]
+                == "distribution does not match cycle rewards (possible skim)"
+                for s in shares
+            ))
+        finally:
+            db.close()
+            fake.close()
+
+    def test_dust_carry_ok(self):
+        # The batch carries 33 lunas of dust beyond the coinbase (2,000,000 +
+        # 33 = 2,000,033), well inside DUST_TOLERANCE_LUNA (500). A/B/C get
+        # exactly their expected share of the coinbase, and the 33 lunas of
+        # swept dust goes to a new mid-cycle staker that lands in unaccounted.
+        # Guard 4a (internal) and 4b (honesty vs the coinbase) both pass and no
+        # staker over-credits -> VERIFIED.
+        fake, db, cfg, jobs = base_env()
+        try:
+            dust = 33
+            stage_open_close(
+                fake,
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                    staker_row(STAKER_C, 30000000),
+                ],
+                [
+                    staker_row(STAKER_A, 40000000 + EXP_A),
+                    staker_row(STAKER_B, 30000000 + EXP_B),
+                    staker_row(STAKER_C, 30000000 + EXP_C),
+                    staker_row(STAKER_D, dust),
+                ],
+            )
+            fake.set_staged_txs([
+                [coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0")],
+                closing_restakes([EXP_A, EXP_B, EXP_C, dust]),
+            ])
+            run_two_pass(jobs)
+
+            cycles = closed_cycle(db)
+            cycle = cycles[0]
+            self.assertEqual(cycle["status"], "VERIFIED")
+            shares = db.cycle_shares(cycle["id"])
+            self.assertTrue(all(s["ok"] == 1 for s in shares))
+        finally:
+            db.close()
+            fake.close()
+
     def test_batch_aware_close_verified(self):
         # Regression for the ImpactZero cycle-60 bug. The bot sends a burst of
         # AddStake txs (blocks 100, 101, 102) inside one distribution event. The
@@ -420,10 +504,12 @@ class VerifyTest(unittest.TestCase):
             close1_a = 40000000 + EXP_A
             close1_b = 30000000 + EXP_B
             close1_c = 30000000 + EXP_C
-            # Cycle 2 expected shares are recomputed from the grown balances.
-            exp2_a = (close1_a * AVAILABLE) // TOTAL_LUNA
-            exp2_b = (close1_b * AVAILABLE) // TOTAL_LUNA
-            exp2_c = (close1_c * AVAILABLE) // TOTAL_LUNA
+            total2 = close1_a + close1_b + close1_c  # validator total grew
+            # Cycle 2 expected shares are recomputed from the grown balances and
+            # the grown validator total.
+            exp2_a = (close1_a * AVAILABLE) // total2
+            exp2_b = (close1_b * AVAILABLE) // total2
+            exp2_c = (close1_c * AVAILABLE) // total2
             fake.set_staged_stakers([
                 # snapshot 1: cycle 1 open
                 [
@@ -452,6 +538,11 @@ class VerifyTest(unittest.TestCase):
                 # past the 10-block gap (closes cycle 2 at block 202)
                 [coinbase_tx(150, COINBASE_AMOUNT, "tx-cb-1")]
                 + spread_staking_txs([exp2_a, exp2_b, exp2_c], 200, gap=1),
+            ])
+            fake.set_staged_validators([
+                {"data": [{"total": TOTAL_LUNA, "numStakers": 3}]},
+                {"data": [{"total": total2, "numStakers": 3}]},
+                {"data": [{"total": total2, "numStakers": 3}]},
             ])
             # Pass 1 opens cycle 1; pass 2 closes it with the first burst and
             # opens cycle 2; pass 3 closes cycle 2 with the second burst.
