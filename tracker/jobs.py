@@ -144,12 +144,10 @@ class Jobs:
         if vrow is None:
             vrow = _first_payload(validator_payload)
         total_luna = int(vrow.get("balance") or vrow.get("total") or vrow.get("totalStake") or 0)
-        num_stakers = int(vrow.get("numStakers") or vrow.get("stakerCount") or 0)
+        api_num_stakers = int(vrow.get("numStakers") or vrow.get("stakerCount") or 0)
         deposit_luna = int(vrow.get("deposit") or vrow.get("validatorDeposit") or 0)
-        self.db.upsert_validator_snapshot(
-            self.cfg.validator_addr, now, total_luna, num_stakers, deposit_luna
-        )
 
+        # Write staker rows first so their sum is available for the deposit.
         staker_sum = 0
         staker_count = 0
         for srow in _list_payload(stakers_payload):
@@ -168,9 +166,10 @@ class Jobs:
         # of staker records when both are present (100000 NIM when known).
         if deposit_luna == 0 and total_luna > 0 and staker_sum > 0 and staker_count > 0:
             deposit_luna = max(total_luna - staker_sum, 0)
-            self.db.upsert_validator_snapshot(
-                self.cfg.validator_addr, now, total_luna, staker_count, deposit_luna
-            )
+        num_stakers = staker_count if staker_count > 0 else api_num_stakers
+        self.db.upsert_validator_snapshot(
+            self.cfg.validator_addr, now, total_luna, num_stakers, deposit_luna
+        )
 
     # ------------------------------------------------------------------- job 2
 
