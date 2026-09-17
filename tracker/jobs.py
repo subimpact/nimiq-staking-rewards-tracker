@@ -194,14 +194,18 @@ class Jobs:
             self._open_pending_cycle()
             return
 
-        # Find the first restake strictly after the cycle's opened_block.
-        boundary = self.db.first_restake_after(
-            self.cfg.validator_addr, int(pending["opened_block"])
+        # Close on the end of the first complete restake batch strictly after the
+        # cycle's opened_block. The restake bot sends a distribution as a burst
+        # of AddStake txs ~1-2 blocks apart; capturing the whole batch keeps the
+        # window aligned with the per-staker balance deltas.
+        boundary = self.db.next_restake_batch(
+            self.cfg.validator_addr, int(pending["opened_block"]),
+            self.cfg.batch_gap_blocks,
         )
         if boundary is None:
             return
 
-        closed_block = int(boundary["block"])
+        closed_block, batch = boundary
         window = self.db.restakes_in_window(
             self.cfg.validator_addr, int(pending["opened_block"]), closed_block
         )
@@ -229,9 +233,11 @@ class Jobs:
         total = int(pending["total_luna"]) or 1
         opened_at_ms = int(pending["opened_at_ms"])
         boundary_hash = ""
-        boundary = self.db.first_restake_after(self.cfg.validator_addr, opened_block)
+        boundary = self.db.next_restake_batch(
+            self.cfg.validator_addr, opened_block, self.cfg.batch_gap_blocks
+        )
         if boundary is not None:
-            boundary_hash = boundary["tx_hash"]
+            boundary_hash = boundary[1][-1]["tx_hash"]
 
         # Option A attribution: active balances only change via AddStake, so a
         # staker's credit is the active-balance delta between the snapshot
@@ -349,17 +355,19 @@ class Jobs:
         that has a closing restake boundary available."""
         pending = self.db.latest_pending_cycle(self.cfg.validator_addr)
         if pending is not None:
-            boundary = self.db.first_restake_after(
-                self.cfg.validator_addr, int(pending["opened_block"])
+            boundary = self.db.next_restake_batch(
+                self.cfg.validator_addr, int(pending["opened_block"]),
+                self.cfg.batch_gap_blocks,
             )
             if boundary is None:
                 # Window not closed yet; nothing to verify.
                 return
+            closed_block, _ = boundary
             window = self.db.restakes_in_window(
                 self.cfg.validator_addr, int(pending["opened_block"]),
-                int(boundary["block"]),
+                closed_block,
             )
-            self._verify_and_close(pending, int(boundary["block"]), window)
+            self._verify_and_close(pending, closed_block, window)
             return
 
         # No pending cycle: re-emit the latest closed cycle's shares (idempotent

@@ -24,6 +24,7 @@ from tests.fake_rpc import (
     STAKER_C,
     VALIDATOR,
     coinbase_tx,
+    spread_staking_txs,
     staking_tx,
     staker_row,
 )
@@ -161,9 +162,9 @@ class VerifyTest(unittest.TestCase):
             self.assertEqual(sum(s["expected_luna"] for s in shares), AVAILABLE)
 
             # G1 ledger populated for verified stakers, credited with the
-            # boundary batch hash.
-            boundary = db.first_restake_after(VALIDATOR, 0)
-            batch_hash = boundary["tx_hash"]
+            # closing batch's last tx hash.
+            boundary = db.next_restake_batch(VALIDATOR, 0, cfg.batch_gap_blocks)
+            batch_hash = boundary[1][-1]["tx_hash"]
             for addr in (STAKER_A, STAKER_B, STAKER_C):
                 rewards = db.staker_rewards(VALIDATOR, addr, 50)
                 self.assertEqual(len(rewards), 1)
@@ -350,6 +351,132 @@ class VerifyTest(unittest.TestCase):
                 s["reason"] == "unaccounted restake value (possible timing drift)"
                 for s in shares
             ))
+        finally:
+            db.close()
+            fake.close()
+
+
+    def test_batch_aware_close_verified(self):
+        # Regression for the ImpactZero cycle-60 bug. The bot sends a burst of
+        # AddStake txs (blocks 100, 101, 102) inside one distribution event. The
+        # old code closed on the FIRST restake (block 100), capturing a partial
+        # batch -> deltas exceed expected + unaccounted -> false MISMATCH and an
+        # empty G1 ledger. Batch-aware close must end at block 102.
+        fake, db, cfg, jobs = base_env()
+        try:
+            stage_open_close(
+                fake,
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                    staker_row(STAKER_C, 30000000),
+                ],
+                [
+                    staker_row(STAKER_A, 40000000 + EXP_A),
+                    staker_row(STAKER_B, 30000000 + EXP_B),
+                    staker_row(STAKER_C, 30000000 + EXP_C),
+                ],
+            )
+            fake.set_staged_txs([
+                [coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0")],
+                spread_staking_txs([EXP_A, EXP_B, EXP_C], 100, gap=1),
+            ])
+            run_two_pass(jobs)
+
+            cycles = closed_cycle(db)
+            cycle = cycles[0]
+            self.assertEqual(cycle["status"], "VERIFIED")
+            # The batch ends at block 102 (last of the 3-tx burst), not 100.
+            self.assertEqual(cycle["closed_block"], 102)
+
+            shares = db.cycle_shares(cycle["id"])
+            by_addr = {s["staker_address"]: s for s in shares}
+            self.assertEqual(by_addr[STAKER_A]["actual_luna"], EXP_A)
+            self.assertEqual(by_addr[STAKER_B]["actual_luna"], EXP_B)
+            self.assertEqual(by_addr[STAKER_C]["actual_luna"], EXP_C)
+            self.assertTrue(all(s["ok"] == 1 for s in shares))
+
+            # The batch's LAST tx hash (block 102) stands in for the credits.
+            boundary = db.next_restake_batch(VALIDATOR, 0, cfg.batch_gap_blocks)
+            last_hash = boundary[1][-1]["tx_hash"]
+            self.assertIn("102", last_hash)
+            for addr in (STAKER_A, STAKER_B, STAKER_C):
+                rewards = db.staker_rewards(VALIDATOR, addr, 50)
+                self.assertEqual(len(rewards), 1)
+                self.assertEqual(rewards[0]["tx_hash"], last_hash)
+                self.assertEqual(rewards[0]["block"], 102)
+        finally:
+            db.close()
+            fake.close()
+
+    def test_batch_gap_splits_batches(self):
+        # Two bursts separated by more than BATCH_GAP_BLOCKS form two separate
+        # cycles, each closing on its own batch end.
+        fake, db, cfg, jobs = base_env()
+        try:
+            # Cycle 1: open base balances, close with batch ending at block 102.
+            # Cycle 2: opened on cycle 1's close, paid from a second burst
+            # (blocks 200-202) well past the 10-block gap.
+            close1_a = 40000000 + EXP_A
+            close1_b = 30000000 + EXP_B
+            close1_c = 30000000 + EXP_C
+            # Cycle 2 expected shares are recomputed from the grown balances.
+            exp2_a = (close1_a * AVAILABLE) // TOTAL_LUNA
+            exp2_b = (close1_b * AVAILABLE) // TOTAL_LUNA
+            exp2_c = (close1_c * AVAILABLE) // TOTAL_LUNA
+            fake.set_staged_stakers([
+                # snapshot 1: cycle 1 open
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                    staker_row(STAKER_C, 30000000),
+                ],
+                # snapshot 2: cycle 1 close == cycle 2 open
+                [
+                    staker_row(STAKER_A, close1_a),
+                    staker_row(STAKER_B, close1_b),
+                    staker_row(STAKER_C, close1_c),
+                ],
+                # snapshot 3: cycle 2 close (strictly after cycle 2 opened)
+                [
+                    staker_row(STAKER_A, close1_a + exp2_a),
+                    staker_row(STAKER_B, close1_b + exp2_b),
+                    staker_row(STAKER_C, close1_c + exp2_c),
+                ],
+            ])
+            fake.set_staged_txs([
+                [coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0")],
+                # first distribution event (closes cycle 1 at block 102)
+                spread_staking_txs([EXP_A, EXP_B, EXP_C], 100, gap=1),
+                # second distribution event: new coinbase + a fresh burst far
+                # past the 10-block gap (closes cycle 2 at block 202)
+                [coinbase_tx(150, COINBASE_AMOUNT, "tx-cb-1")]
+                + spread_staking_txs([exp2_a, exp2_b, exp2_c], 200, gap=1),
+            ])
+            # Pass 1 opens cycle 1; pass 2 closes it with the first burst and
+            # opens cycle 2; pass 3 closes cycle 2 with the second burst.
+            run_pass(jobs)
+            run_pass(jobs)
+            run_pass(jobs)
+
+            cycles = closed_cycle(db)
+            self.assertEqual(len(cycles), 2)
+            # Oldest first.
+            c1, c2 = cycles[::-1]
+            self.assertEqual(c1["closed_block"], 102)
+            self.assertEqual(c2["closed_block"], 202)
+            self.assertEqual(c1["status"], "VERIFIED")
+            self.assertEqual(c2["status"], "VERIFIED")
+
+            # Each cycle attributed its own full batch.
+            c1_by = {s["staker_address"]: s for s in db.cycle_shares(c1["id"])}
+            c2_by = {s["staker_address"]: s for s in db.cycle_shares(c2["id"])}
+            self.assertEqual(c1_by[STAKER_A]["actual_luna"], EXP_A)
+            self.assertEqual(c1_by[STAKER_B]["actual_luna"], EXP_B)
+            self.assertEqual(c1_by[STAKER_C]["actual_luna"], EXP_C)
+            self.assertEqual(c2_by[STAKER_A]["actual_luna"], exp2_a)
+            self.assertEqual(c2_by[STAKER_B]["actual_luna"], exp2_b)
+            self.assertEqual(c2_by[STAKER_C]["actual_luna"], exp2_c)
         finally:
             db.close()
             fake.close()
