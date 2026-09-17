@@ -38,7 +38,10 @@ class LiveFetcher:
         req = urllib.request.Request(
             self.cfg.rpc_url,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "nimiq-staking-rewards-tracker/1.0 (+https://github.com/subimpact/nimiq-staking-rewards-tracker)",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -47,18 +50,24 @@ class LiveFetcher:
             raise RuntimeError("RPC error: %s" % payload["error"])
         return payload.get("result")
 
+    def _get(self, url):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "nimiq-staking-rewards-tracker/1.0 (+https://github.com/subimpact/nimiq-staking-rewards-tracker)",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
     def get_transactions(self, address):
         return self._rpc("getTransactionsByAddress", [address, MAX_TX_BATCH, None])
 
     def get_stakers(self):
-        url = self.cfg.stakers_url()
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        return self._get(self.cfg.stakers_url())
 
     def get_validators(self):
-        url = self.cfg.validators_url()
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        return self._get(self.cfg.validators_url())
 
 
 def _tx_block(tx):
