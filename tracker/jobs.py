@@ -134,7 +134,15 @@ class Jobs:
         validator_payload = self.fetcher.get_validators()
         stakers_payload = self.fetcher.get_stakers()
 
-        vrow = _first_payload(validator_payload)
+        vrows = _list_payload(validator_payload)
+        ours = self.cfg.validator_addr.replace(" ", "").lower()
+        vrow = next(
+            (r for r in vrows if isinstance(r, dict) and r.get("address")
+             and r["address"].replace(" ", "").lower() == ours),
+            None,
+        )
+        if vrow is None:
+            vrow = _first_payload(validator_payload)
         total_luna = int(vrow.get("balance") or vrow.get("total") or vrow.get("totalStake") or 0)
         num_stakers = int(vrow.get("numStakers") or vrow.get("stakerCount") or 0)
         deposit_luna = int(vrow.get("deposit") or vrow.get("validatorDeposit") or 0)
@@ -158,7 +166,7 @@ class Jobs:
 
         # Deposit is not exposed by the API; derive it as total minus the sum
         # of staker records when both are present (100000 NIM when known).
-        if deposit_luna == 0 and total_luna > 0 and staker_sum > 0:
+        if deposit_luna == 0 and total_luna > 0 and staker_sum > 0 and staker_count > 0:
             deposit_luna = max(total_luna - staker_sum, 0)
             self.db.upsert_validator_snapshot(
                 self.cfg.validator_addr, now, total_luna, staker_count, deposit_luna
