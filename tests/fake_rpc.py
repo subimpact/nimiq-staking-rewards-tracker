@@ -104,7 +104,7 @@ class FakeServer:
 def coinbase_tx(block, value_luna, tx_hash, ts=None):
     return {
         "blockNumber": block,
-        "sender": "NQ81 C01N BASE 0000 0000 0000 0000 0000 0001",
+        "sender": "NQ81 C01N BASE 0000 0000 0000 0000 0000 0000",
         "recipient": REWARD_ADDR,
         "value": value_luna,
         "timestamp": ts if ts is not None else block * 1000,
