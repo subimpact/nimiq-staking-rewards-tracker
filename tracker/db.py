@@ -109,6 +109,15 @@ class DB:
             self.conn.execute(
                 "ALTER TABLE cycle_shares ADD COLUMN reason TEXT NOT NULL DEFAULT ''"
             )
+        rcols = {
+            r["name"] for r in self.conn.execute(
+                "PRAGMA table_info(restake_txs)"
+            ).fetchall()
+        }
+        if "staker_address" not in rcols:
+            self.conn.execute(
+                "ALTER TABLE restake_txs ADD COLUMN staker_address TEXT NOT NULL DEFAULT ''"
+            )
         self.conn.commit()
 
     def close(self):
@@ -372,6 +381,25 @@ class DB:
         )
         self.conn.commit()
 
+    def credit_staker_reward(self, staker_address, block, amount_luna, tx_hash,
+                             ts_ms):
+        """One credit per (staker, cycle-closing block). Re-verification may
+        upgrade a share's tx_hash from the boundary stand-in to the staker's
+        real AddStake hash; a bare upsert would leave BOTH rows (the PK includes
+        tx_hash), duplicating the credit on the ledger. Delete-then-insert keeps
+        the credit singular and always carries the freshest hash."""
+        self.conn.execute(
+            "DELETE FROM staker_rewards WHERE staker_address=? AND block=?",
+            (staker_address, block),
+        )
+        self.conn.execute(
+            "INSERT INTO staker_rewards "
+            "(staker_address, block, amount_luna, tx_hash, ts_ms) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (staker_address, block, amount_luna, tx_hash, ts_ms),
+        )
+        self.conn.commit()
+
     def staker_rewards(self, validator, address, limit):
         rows, _ = self.staker_rewards_before(validator, address, limit, None)
         return rows
@@ -402,12 +430,12 @@ class DB:
 
     # ---- restake txs ----
 
-    def upsert_restake(self, validator, block, to_addr, amount_luna, ts_ms, tx_hash):
+    def upsert_restake(self, validator, block, to_addr, amount_luna, ts_ms, tx_hash, staker_address=""):
         self.conn.execute(
             "INSERT OR REPLACE INTO restake_txs "
-            "(validator, block, to_addr, amount_luna, ts_ms, tx_hash) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (validator, block, to_addr, amount_luna, ts_ms, tx_hash),
+            "(validator, block, to_addr, amount_luna, ts_ms, tx_hash, staker_address) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (validator, block, to_addr, amount_luna, ts_ms, tx_hash, staker_address),
         )
         self.conn.commit()
 
@@ -449,6 +477,17 @@ class DB:
             "SELECT * FROM restake_txs WHERE validator=? AND block>? AND block<=? "
             "ORDER BY block ASC",
             (validator, start_block, end_block),
+        ).fetchall()
+        return rows
+
+    def restakes_for_staker(self, validator, start_block, end_block, staker):
+        """Restakes in the window whose on-chain attribution names `staker`
+        (via relatedAddresses at ingest). Empty string means the endpoint did
+        not expose the mapping; the caller falls back to balance-delta math."""
+        rows = self.conn.execute(
+            "SELECT * FROM restake_txs WHERE validator=? AND block>? AND block<=? "
+            "AND staker_address=? ORDER BY block ASC",
+            (validator, start_block, end_block, staker),
         ).fetchall()
         return rows
 

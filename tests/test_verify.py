@@ -121,6 +121,15 @@ def closing_restakes(amounts):
     return [staking_tx(100, v, "tx-%d" % i) for i, v in enumerate(amounts)]
 
 
+def closing_restakes_attributed(amounts, stakers):
+    """Closing batch whose txs carry relatedAddresses naming each credited
+    staker, exactly like the production explorer RPC response."""
+    return [
+        staking_tx(100, v, "tx-%d" % i, staker=stakers[i])
+        for i, v in enumerate(amounts)
+    ]
+
+
 class VerifyTest(unittest.TestCase):
     def test_verified_cycle_three_stakers(self):
         fake, db, cfg, jobs = base_env()
@@ -172,6 +181,72 @@ class VerifyTest(unittest.TestCase):
                 self.assertEqual(len(rewards), 1)
                 self.assertEqual(rewards[0]["tx_hash"], batch_hash)
                 self.assertEqual(rewards[0]["block"], cycle["closed_block"])
+        finally:
+            db.close()
+            fake.close()
+
+    def test_attributed_cycle_per_staker_tx_hashes(self):
+        """When the explorer names each credited staker in relatedAddresses,
+        every share and ledger row carries that staker's OWN AddStake tx hash,
+        not the shared boundary hash."""
+        fake, db, cfg, jobs = base_env()
+        try:
+            stage_open_close(
+                fake,
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                    staker_row(STAKER_C, 30000000),
+                ],
+                [
+                    staker_row(STAKER_A, 40000000 + EXP_A),
+                    staker_row(STAKER_B, 30000000 + EXP_B),
+                    staker_row(STAKER_C, 30000000 + EXP_C),
+                ],
+            )
+            fake.set_staged_txs([
+                [coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0")],
+                closing_restakes_attributed(
+                    [EXP_A, EXP_B, EXP_C], [STAKER_A, STAKER_B, STAKER_C]
+                ),
+            ])
+            run_two_pass(jobs)
+
+            cycle = closed_cycle(db)[0]
+            self.assertEqual(cycle["status"], "VERIFIED")
+
+            # restake_txs carries the on-chain attribution.
+            rows = db.restakes_in_window(VALIDATOR, 0, cycle["closed_block"])
+            self.assertEqual(
+                {r["staker_address"] for r in rows},
+                {STAKER_A, STAKER_B, STAKER_C},
+            )
+            by_addr = {r["staker_address"]: r for r in rows}
+            self.assertEqual(by_addr[STAKER_A]["tx_hash"], "tx-0")
+            self.assertEqual(by_addr[STAKER_C]["tx_hash"], "tx-2")
+
+            # Shares carry the staker's own hash (distinct across stakers).
+            shares = db.cycle_shares(cycle["id"])
+            share_by_addr = {s["staker_address"]: s for s in shares}
+            hashes = {s["tx_hash"] for s in shares}
+            self.assertEqual(len(hashes), 3)  # no shared boundary stand-in
+            self.assertEqual(share_by_addr[STAKER_A]["tx_hash"], "tx-0")
+            self.assertEqual(share_by_addr[STAKER_B]["tx_hash"], "tx-1")
+            self.assertEqual(share_by_addr[STAKER_C]["tx_hash"], "tx-2")
+
+            # Ledger rows too, and still one credit per staker.
+            for addr, expected_hash in (
+                (STAKER_A, "tx-0"), (STAKER_B, "tx-1"), (STAKER_C, "tx-2"),
+            ):
+                rewards = db.staker_rewards(VALIDATOR, addr, 50)
+                self.assertEqual(len(rewards), 1)
+                self.assertEqual(rewards[0]["tx_hash"], expected_hash)
+
+            # Re-verification must NOT duplicate the credit.
+            jobs.run_verify()
+            jobs.run_verify()
+            for addr in (STAKER_A, STAKER_B, STAKER_C):
+                self.assertEqual(len(db.staker_rewards(VALIDATOR, addr, 50)), 1)
         finally:
             db.close()
             fake.close()
