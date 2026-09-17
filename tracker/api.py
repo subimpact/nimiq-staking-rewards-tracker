@@ -243,7 +243,7 @@ def _staker_json(r):
 
 
 def _share_json(r):
-    return {
+    payload = {
         "cycle_id": r["cycle_id"],
         "staker_address": r["staker_address"],
         "expected_luna": r["expected_luna"],
@@ -251,6 +251,9 @@ def _share_json(r):
         "tx_hash": r["tx_hash"],
         "ok": bool(r["ok"]),
     }
+    if r["reason"]:
+        payload["reason"] = r["reason"]
+    return payload
 
 
 def _reward_json(r):

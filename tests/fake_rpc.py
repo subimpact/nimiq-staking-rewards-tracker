@@ -39,7 +39,7 @@ class FakeRPC(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/api/stakers/"):
-            result = self.server.fake.stakers_payload
+            result = self.server.fake.stakers_payload_now()
         elif self.path.startswith("/api/validators"):
             result = self.server.fake.validators_payload
         else:
@@ -76,6 +76,21 @@ class FakeServer:
 
     def set_stakers(self, rows):
         self.stakers_payload = {"data": rows}
+
+    def set_staged_stakers(self, stages):
+        """Serve one stakers payload per get_stakers call, in order. Each stage
+        is a list of staker rows."""
+        queue = list(stages)
+
+        def handler():
+            return {"data": queue.pop(0)} if queue else {"data": []}
+        self._staged_stakers = handler
+
+    def stakers_payload_now(self):
+        handler = getattr(self, "_staged_stakers", None)
+        if handler is not None:
+            return handler()
+        return self.stakers_payload
 
     def set_validator(self, total_luna, num_stakers, deposit_luna=0):
         self.validators_payload = {
