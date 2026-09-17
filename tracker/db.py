@@ -82,6 +82,19 @@ CREATE TABLE IF NOT EXISTS restake_txs (
   validator TEXT, block INTEGER, to_addr TEXT, amount_luna INTEGER, ts_ms INTEGER,
   tx_hash TEXT, PRIMARY KEY (validator, block, to_addr, tx_hash)
 );
+
+CREATE TABLE IF NOT EXISTS epoch_stats (
+  validator TEXT,
+  epoch INTEGER,
+  start_block INTEGER,
+  end_block INTEGER,
+  micro_total INTEGER,
+  produced INTEGER,
+  reward_count INTEGER,
+  reward_sum_luna INTEGER,
+  updated_at_ms INTEGER,
+  PRIMARY KEY (validator, epoch)
+);
 """
 
 
@@ -497,6 +510,29 @@ class DB:
             (validator,),
         ).fetchone()
         return int(row["m"]) if row and row["m"] is not None else 0
+
+    # ---- epoch stats ----
+
+    def upsert_epoch_stats(self, validator, epoch, start_block, end_block,
+                           micro_total, produced, reward_count, reward_sum_luna,
+                           updated_at_ms):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO epoch_stats "
+            "(validator, epoch, start_block, end_block, micro_total, produced, "
+            "reward_count, reward_sum_luna, updated_at_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (validator, epoch, start_block, end_block, micro_total, produced,
+             reward_count, reward_sum_luna, updated_at_ms),
+        )
+        self.conn.commit()
+
+    def epoch_stats(self, validator, limit=20):
+        rows = self.conn.execute(
+            "SELECT * FROM epoch_stats WHERE validator=? "
+            "ORDER BY epoch DESC LIMIT ?",
+            (validator, limit),
+        ).fetchall()
+        return rows
 
     # ---- misc ----
 
