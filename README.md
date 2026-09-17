@@ -5,7 +5,7 @@ Standard staking-rewards tracking (G1) plus on-chain integrity verification (G2)
 Answers the two community gaps from [core-rs-albatross #3170](https://github.com/nimiq/core-rs-albatross/issues/3170) and [#3171](https://github.com/nimiq/core-rs-albatross/issues/3171):
 
 - G1: a per-staker rewards ledger (stake, pool share, every credited reward with its tx hash, compounding history).
-- G2: distribution integrity. Every restake cycle is recomputed from chain state and compared with the actual on-chain restake transactions. Each cycle is labelled VERIFIED or MISMATCH and the math is shown line by line.
+- G2: distribution integrity. Every restake cycle is recomputed from chain state and compared with the actual on-chain restake transactions. Each cycle is labelled VERIFIED, MISMATCH or SKIPPED and the math is shown line by line.
 
 Reference deployment: the ImpactZero validator (0% fee, NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY). Live UI at nimiq.subimpact.net.
 
@@ -44,7 +44,7 @@ G2 is the verifier. For a closed cycle:
 - actual_i = sum of the restake values sent to that staker in the window.
 - A staker line is OK when actual_i equals expected_i, or when expected_i is below MIN_SHARE_LUNA and actual_i is zero (the dust floor skips it), or when abs(actual_i - expected_i) <= 1 (rounding tolerance).
 
-The cycle is VERIFIED only when every staker line is OK; otherwise it is MISMATCH, with the per-line expected and actual stored in `cycle_shares`.
+The cycle is VERIFIED only when every staker line is OK; otherwise it is MISMATCH, with the per-line expected and actual stored in `cycle_shares`. A cycle is SKIPPED when its window is shorter than a block-reward interval (60 blocks) yet contains payouts: such a slice cannot contain the income that funds its payouts, so there is nothing to verify and no verdict is issued.
 
 G1 is the ledger. Every OK staker line from a verified or mismatched cycle is credited into `staker_rewards`, which is what the dashboard shows. Mismatched stakers are not credited.
 

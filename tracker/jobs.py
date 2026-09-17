@@ -261,6 +261,30 @@ class Jobs:
         if available < 0:
             available = 0
 
+        # Restake total in the window (also used by guard 4a below).
+        sum_txs = _sum_ints(r["amount_luna"] for r in window)
+
+        # Degenerate-window guard: a coinbase lands every 60 blocks, so a
+        # window shorter than that can never contain the income that funds its
+        # payouts. When the cycle opener lands mid-burst (the bot spreads one
+        # distribution across 1-2 blocks a second apart), the window collapses
+        # to a block or two: payouts appear, but their funding coinbase sits in
+        # the adjacent window, so expected is 0 for every staker and Guard 5
+        # would MISMATCH every paid staker. There is nothing to verify: the
+        # restake txs remain on record in restake_txs for auditors, and the
+        # funding income is verified in its own window. Close SKIPPED.
+        # A window >= 60 blocks with payouts and no income is a real anomaly
+        # (operator paid with no earnings) and still goes MISMATCH.
+        span = closed_block - opened_block
+        if available == 0 and sum_txs > 0 and span < 60:
+            self.db.clear_cycle_shares(pending["id"])
+            self.db.close_cycle(
+                pending["id"], closed_block, self._now_ms(),
+                available, held, "SKIPPED",
+            )
+            self._open_pending_cycle()
+            return
+
         total = int(pending["total_luna"]) or 1
         opened_at_ms = int(pending["opened_at_ms"])
         boundary_hash = ""
@@ -367,7 +391,6 @@ class Jobs:
         # Guard 4a: internal consistency of the attribution. The sum of on-chain
         # restakes must match the sum of attributed deltas plus any unaccounted
         # (restaked) value within 1 luna, else the window was mis-windowed.
-        sum_txs = _sum_ints(r["amount_luna"] for r in window)
         drift = abs(sum_txs - (sum_delta + unaccounted)) > 1
 
         # Guard 4b: honesty against the cycle's actual reward income. The bot

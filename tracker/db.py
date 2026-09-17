@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS cycles (
   reserve_luna INTEGER,
   held_luna INTEGER DEFAULT 0,
   total_luna INTEGER,
-  status TEXT CHECK (status IN ('PENDING','VERIFIED','MISMATCH')),
+  status TEXT CHECK (status IN ('PENDING','VERIFIED','MISMATCH','SKIPPED')),
   opened_at_ms INTEGER,
   closed_at_ms INTEGER
 );
@@ -131,6 +131,45 @@ class DB:
             self.conn.execute(
                 "ALTER TABLE restake_txs ADD COLUMN staker_address TEXT NOT NULL DEFAULT ''"
             )
+        # cycles.status grew a 'SKIPPED' value for degenerate windows (payouts
+        # in a sub-60-block slice cannot contain the funding coinbase, so the
+        # cycle cannot be verified and must not be MISMATCH). SQLite cannot
+        # ALTER a CHECK constraint, so rebuild the table when the old
+        # constraint is present.
+        csql = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='cycles'"
+        ).fetchone()
+        if csql is not None and "SKIPPED" not in (csql["sql"] or ""):
+            self.conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                self.conn.executescript(
+                    """
+                    CREATE TABLE cycles_mig (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      validator TEXT,
+                      opened_block INTEGER,
+                      closed_block INTEGER,
+                      available_luna INTEGER,
+                      reserve_luna INTEGER,
+                      held_luna INTEGER DEFAULT 0,
+                      total_luna INTEGER,
+                      status TEXT CHECK (status IN ('PENDING','VERIFIED','MISMATCH','SKIPPED')),
+                      opened_at_ms INTEGER,
+                      closed_at_ms INTEGER
+                    );
+                    INSERT INTO cycles_mig (id, validator, opened_block, closed_block,
+                      available_luna, reserve_luna, held_luna, total_luna, status,
+                      opened_at_ms, closed_at_ms)
+                      SELECT id, validator, opened_block, closed_block,
+                      available_luna, reserve_luna, held_luna, total_luna, status,
+                      opened_at_ms, closed_at_ms FROM cycles;
+                    DROP TABLE cycles;
+                    ALTER TABLE cycles_mig RENAME TO cycles;
+                    """
+                )
+                self.conn.commit()
+            finally:
+                self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.commit()
 
     def close(self):
