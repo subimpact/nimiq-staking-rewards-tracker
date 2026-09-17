@@ -82,6 +82,23 @@ class ApiTest(unittest.TestCase):
         ) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
 
+    def test_epochs_empty_then_populated(self):
+        status, body = self._get("/api/validators/%s/epochs" % VALIDATOR)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["epochs"], [])
+        self.db.upsert_epoch_stats(
+            VALIDATOR, 1352, 61819201, 61843200,
+            42480, 155, 238, 141876466, 1,
+        )
+        status, body = self._get("/api/validators/%s/epochs" % VALIDATOR)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["epochs"]), 1)
+        e = body["epochs"][0]
+        self.assertEqual(e["epoch"], 1352)
+        self.assertEqual(e["produced"], 155)
+        self.assertEqual(e["micro_total"], 42480)
+        self.assertEqual(e["reward_count"], 238)
+
     def test_health(self):
         status, body = self._get("/api/health")
         self.assertEqual(status, 200)

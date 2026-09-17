@@ -57,6 +57,8 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self._stakers(params["vaddr"])
             elif kind == "cycles":
                 payload = self._cycles(params["vaddr"], params)
+            elif kind == "epochs":
+                payload = self._epochs(params["vaddr"])
             elif kind == "shares":
                 payload = self._shares(params["vaddr"], params["cid"])
             elif kind == "rewards":
@@ -123,6 +125,10 @@ class Handler(BaseHTTPRequestHandler):
         )
         return {"cycles": [_cycle_json(r) for r in rows], "has_more": has_more}
 
+    def _epochs(self, vaddr):
+        rows = self.server.db.epoch_stats(vaddr)
+        return {"epochs": [dict(r) for r in rows]}
+
     def _shares(self, vaddr, cid):
         db = self.server.db
         cycle = db.get_cycle(cid)
@@ -179,6 +185,13 @@ class Handler(BaseHTTPRequestHandler):
             merged = dict(params)
             merged.update({"vaddr": unq(m.group("vaddr"))})
             return {"kind": "cycles", "params": merged}
+        m = re.match(
+            r"^/api/validators/(?P<vaddr>[^/]+)/epochs$", path_only
+        )
+        if m:
+            merged = dict(params)
+            merged.update({"vaddr": unq(m.group("vaddr"))})
+            return {"kind": "epochs", "params": merged}
         m = re.match(
             r"^/api/validators/(?P<vaddr>[^/]+)/cycles/(?P<cid>[0-9]+)/shares$",
             path_only,
