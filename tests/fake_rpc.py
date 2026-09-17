@@ -142,6 +142,16 @@ def staking_tx(block, value_luna, tx_hash):
     return restake_tx(block, STAKING_CONTRACT_ADDR, value_luna, tx_hash)
 
 
+def spread_staking_txs(amounts, start_block, gap=1):
+    """AddStake burst with one tx per block, `gap` blocks apart. Mimics the
+    restake bot's distribution: blocks differ by 1-2 (within BATCH_GAP_BLOCKS)."""
+    out = []
+    for i, v in enumerate(amounts):
+        block = start_block + i * gap
+        out.append(staking_tx(block, v, "tx-%d" % block))
+    return out
+
+
 def staker_row(address, balance_luna, inactive=0):
     return {
         "address": address,

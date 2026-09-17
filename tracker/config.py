@@ -17,6 +17,11 @@ DEFAULT_VALIDATOR_ADDR = "NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY"
 COINBASE_ADDR = "NQ81 C01N BASE 0000 0000 0000 0000 0000 0000"
 STAKING_CONTRACT_ADDR = "NQ77 0000 0000 0000 0000 0000 0000 0000 0001"
 
+# A distribution burst arrives as AddStake txs ~1-2s apart (blocks differ by
+# 1-2). A gap strictly larger than this between consecutive restake blocks means
+# a new distribution event (or a pause), so it splits batches.
+BATCH_GAP_BLOCKS = 10
+
 
 def _get_int(env, name, default):
     raw = env.get(name)
@@ -47,6 +52,7 @@ class Config:
         self.min_trigger_luna = _get_int(env, "MIN_TRIGGER_LUNA", 2000)
         self.min_share_luna = _get_int(env, "MIN_SHARE_LUNA", 500)
         self.reserve_luna = _get_int(env, "RESERVE_LUNA", 100000)
+        self.batch_gap_blocks = _get_int(env, "BATCH_GAP_BLOCKS", BATCH_GAP_BLOCKS)
         self.data_dir = _get_str(env, "DATA_DIR", "/data")
         self.port = _get_int(env, "PORT", 8649)
         self.poll_seconds = _get_int(env, "POLL_SECONDS", 60)

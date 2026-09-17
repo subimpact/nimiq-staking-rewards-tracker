@@ -378,6 +378,30 @@ class DB:
         ).fetchone()
         return row
 
+    def next_restake_batch(self, validator, after_block, gap_blocks):
+        """Return (last_block, rows) for the first complete restake batch strictly
+        after after_block, or None when there are no restakes beyond it.
+
+        A batch is a run of restakes where consecutive blocks differ by at most
+        gap_blocks; a larger gap (a new distribution event or a pause) starts a
+        new batch. last_block is the block of the batch's final tx, which becomes
+        the cycle's closed_block."""
+        rows = self.conn.execute(
+            "SELECT * FROM restake_txs WHERE validator=? AND block>? "
+            "ORDER BY block ASC",
+            (validator, after_block),
+        ).fetchall()
+        if not rows:
+            return None
+        batch = [rows[0]]
+        last = int(rows[0]["block"])
+        for row in rows[1:]:
+            if int(row["block"]) - last > gap_blocks:
+                break
+            batch.append(row)
+            last = int(row["block"])
+        return last, batch
+
     def restakes_in_window(self, validator, start_block, end_block):
         """Restakes with start_block < block <= end_block (closing batch inclusive)."""
         rows = self.conn.execute(
