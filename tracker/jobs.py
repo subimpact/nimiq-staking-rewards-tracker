@@ -314,12 +314,17 @@ class Jobs:
             if addr in reason_map:
                 ok = False
                 reason = reason_map[addr]
-            elif actual > expected + 1:
-                # Guard 5: credit exceeds expected share.
+            elif actual > expected + self.cfg.dust_tolerance_luna:
+                # Guard 5: credit exceeds expected share by more than the dust
+                # noise floor. The bot skips dust shares (< MIN_SHARE) each
+                # cycle and sweeps the carry into later batches, and its live
+                # staker view lags our minute-snapshots by a few lunas, so a
+                # small overage is normal operating behavior. Anything beyond
+                # the tolerance is an external top-up or misallocation.
                 ok = False
                 reason = "credit exceeds expected share (possible external top-up)"
             else:
-                ok = _is_ok(expected, actual, self.cfg.min_share_luna)
+                ok = _is_ok(expected, actual, self.cfg.min_share_luna, self.cfg.dust_tolerance_luna)
                 reason = ""
             all_ok = all_ok and ok
             self.db.upsert_cycle_share(
@@ -443,12 +448,20 @@ def _is_coinbase(sender):
     return COINBASE_ADDR.replace(" ", "") in sender.replace(" ", "").upper()
 
 
-def _is_ok(expected, actual, min_share):
+def _is_ok(expected, actual, min_share, dust_tolerance=500):
     if actual == expected:
         return True
     if expected < min_share and actual == 0:
         return True
+    # Integer-rounding tolerance (the bot floors each share).
     if abs(actual - expected) <= 1:
+        return True
+    # Dust-noise floor: actual may exceed expected by up to one dust
+    # tolerance because dust shares (< min_share) are skipped and swept into
+    # later batches, and the bot's live staker view lags the verifier's
+    # snapshots by a few lunas. Upper drift within the tolerance is normal;
+    # under-drift (actual < expected - 1) still flags.
+    if actual > expected and actual - expected <= dust_tolerance:
         return True
     return False
 
