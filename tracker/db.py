@@ -306,12 +306,33 @@ class DB:
         return row
 
     def recent_cycles(self, validator, limit):
-        rows = self.conn.execute(
-            "SELECT * FROM cycles WHERE validator=? "
-            "ORDER BY id DESC LIMIT ?",
-            (validator, limit),
-        ).fetchall()
+        rows, _ = self.recent_cycles_before(validator, limit, None)
         return rows
+
+    def recent_cycles_before(self, validator, limit, before_id):
+        """Latest `limit` cycles, optionally strictly older than `before_id`.
+        Returns (rows, has_more) where has_more is True when older rows exist."""
+        if before_id is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM cycles WHERE validator=? AND id<? "
+                "ORDER BY id DESC LIMIT ?",
+                (validator, before_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM cycles WHERE validator=? "
+                "ORDER BY id DESC LIMIT ?",
+                (validator, limit),
+            ).fetchall()
+        # has_more is true if any cycle has a smaller id than the oldest shown.
+        if not rows:
+            return rows, False
+        oldest = rows[-1]["id"]
+        older = self.conn.execute(
+            "SELECT 1 FROM cycles WHERE validator=? AND id<? LIMIT 1",
+            (validator, oldest),
+        ).fetchone()
+        return rows, older is not None
 
     # ---- cycle shares ----
 
@@ -352,12 +373,32 @@ class DB:
         self.conn.commit()
 
     def staker_rewards(self, validator, address, limit):
-        rows = self.conn.execute(
-            "SELECT * FROM staker_rewards WHERE staker_address=? "
-            "ORDER BY ts_ms DESC LIMIT ?",
-            (address, limit),
-        ).fetchall()
+        rows, _ = self.staker_rewards_before(validator, address, limit, None)
         return rows
+
+    def staker_rewards_before(self, validator, address, limit, before_block):
+        """Latest `limit` credits, optionally strictly older than `before_block`.
+        Returns (rows, has_more) where has_more is True when older rows exist."""
+        if before_block is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM staker_rewards WHERE staker_address=? AND block<? "
+                "ORDER BY block DESC LIMIT ?",
+                (address, before_block, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM staker_rewards WHERE staker_address=? "
+                "ORDER BY block DESC LIMIT ?",
+                (address, limit),
+            ).fetchall()
+        if not rows:
+            return rows, False
+        oldest = rows[-1]["block"]
+        older = self.conn.execute(
+            "SELECT 1 FROM staker_rewards WHERE staker_address=? AND block<? LIMIT 1",
+            (address, oldest),
+        ).fetchone()
+        return rows, older is not None
 
     # ---- restake txs ----
 
