@@ -292,11 +292,21 @@ class Jobs:
         all_ok = True
         sum_delta = 0
         expected_total = 0
+        # Denominator = sum of staker ledger balances at cycle open, matching
+        # what the payout engine actually distributes against (its validator
+        # balance excludes the 100k deposit, so the deposit's earned slice is
+        # redistributed to stakers; the verifier must expect that). Falls back
+        # to the validator total when no staker snapshots exist.
+        staker_sum = sum(
+            (self.db.staker_balance_at(self.cfg.validator_addr, a, opened_at_ms) or 0)
+            for a in open_addrs
+        )
+        denom = staker_sum if staker_sum > 0 else total
         for addr in open_addrs:
             balance = self.db.staker_balance_at(
                 self.cfg.validator_addr, addr, opened_at_ms
             ) or 0
-            expected = (balance * available) // total
+            expected = (balance * available) // denom
             expected_total += expected
             actual = actual_map[addr]
             sum_delta += actual
