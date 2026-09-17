@@ -15,6 +15,7 @@ from tracker.db import DB
 from tests.fake_rpc import (
     STAKER_A,
     STAKER_B,
+    STAKER_C,
     VALIDATOR,
 )
 
@@ -130,6 +131,63 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(body["rewards"]), 1)
         self.assertEqual(body["rewards"][0]["amount_luna"], 760000)
+
+    def test_rewards_limit_is_honored(self):
+        """Regression: query-string limit was dropped, so the API always
+        returned up to 50 rows (the page said "last 10" but rendered 50)."""
+        for i in range(5):
+            self.db.upsert_staker_reward(STAKER_A, 300 + i, 100000 + i, "tx-%d" % i, 1000 + i)
+        status, body = self._get(
+            "/api/validators/%s/stakers/%s/rewards?limit=3" % (VALIDATOR, STAKER_A)
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["rewards"]), 3)
+        self.assertTrue(body["has_more"])
+        # Newest first (ordered by block desc).
+        blocks = [r["block"] for r in body["rewards"]]
+        self.assertEqual(blocks, sorted(blocks, reverse=True))
+
+    def test_rewards_before_cursor(self):
+        for i in range(5):
+            self.db.upsert_staker_reward(STAKER_C, 400 + i, 200000 + i, "tx-%d" % i, 1000 + i)
+        # First page: latest 2 (blocks 404, 403).
+        status, p1 = self._get(
+            "/api/validators/%s/stakers/%s/rewards?limit=2" % (VALIDATOR, STAKER_C)
+        )
+        self.assertEqual([r["block"] for r in p1["rewards"]], [404, 403])
+        self.assertTrue(p1["has_more"])
+        # Second page: before block 403 -> blocks 402, 401.
+        status, p2 = self._get(
+            "/api/validators/%s/stakers/%s/rewards?limit=2&before=403" % (VALIDATOR, STAKER_C)
+        )
+        self.assertEqual([r["block"] for r in p2["rewards"]], [402, 401])
+        self.assertTrue(p2["has_more"])
+        # Third page: before 401 -> just 400, no more.
+        status, p3 = self._get(
+            "/api/validators/%s/stakers/%s/rewards?limit=2&before=401" % (VALIDATOR, STAKER_C)
+        )
+        self.assertEqual([r["block"] for r in p3["rewards"]], [400])
+        self.assertFalse(p3["has_more"])
+
+    def test_cycles_has_more_and_before(self):
+        # 1 seeded cycle + 2 here = 3 total.
+        cid2 = self.db.create_cycle(VALIDATOR, 300, 300000, 100000000, RESERVE)
+        self.db.close_cycle(cid2, 400, 400000, 1000000, 0, "VERIFIED")
+        cid3 = self.db.create_cycle(VALIDATOR, 500, 500000, 100000000, RESERVE)
+        self.db.close_cycle(cid3, 600, 600000, 1000000, 0, "VERIFIED")
+        status, body = self._get(
+            "/api/validators/%s/cycles?limit=2" % VALIDATOR
+        )
+        self.assertEqual(status, 200)
+        ids = [c["id"] for c in body["cycles"]]
+        self.assertEqual(ids, sorted(ids, reverse=True))
+        self.assertEqual(len(ids), 2)
+        self.assertTrue(body["has_more"])
+        status, p2 = self._get(
+            "/api/validators/%s/cycles?limit=2&before=%d" % (VALIDATOR, ids[-1])
+        )
+        self.assertEqual(len(p2["cycles"]), 1)
+        self.assertFalse(p2["has_more"])
 
     def test_verify_route(self):
         status, body = self._get("/api/verify?limit=10")

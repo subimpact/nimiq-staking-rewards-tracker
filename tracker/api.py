@@ -86,8 +86,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _verify(self, params):
         limit = _int_param(params, "limit", 50)
-        rows = self.server.db.recent_cycles(self.server.cfg.validator_addr, limit)
-        return {"cycles": [_cycle_json(r) for r in rows]}
+        before = _int_param(params, "before", None) if "before" in params else None
+        if before is not None and before < 1:
+            before = None
+        rows, has_more = self.server.db.recent_cycles_before(
+            self.server.cfg.validator_addr, limit, before
+        )
+        return {"cycles": [_cycle_json(r) for r in rows], "has_more": has_more}
 
     def _summary(self, vaddr):
         db = self.server.db
@@ -114,8 +119,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _cycles(self, vaddr, params):
         limit = _int_param(params, "limit", 50)
-        rows = self.server.db.recent_cycles(vaddr, limit)
-        return {"cycles": [_cycle_json(r) for r in rows]}
+        before = _int_param(params, "before", None) if "before" in params else None
+        if before is not None and before < 1:
+            before = None
+        rows, has_more = self.server.db.recent_cycles_before(
+            vaddr, limit, before
+        )
+        return {"cycles": [_cycle_json(r) for r in rows], "has_more": has_more}
 
     def _shares(self, vaddr, cid):
         db = self.server.db
@@ -130,10 +140,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _rewards(self, saddr, params):
         limit = _int_param(params, "limit", 50)
-        rows = self.server.db.staker_rewards(
-            self.server.cfg.validator_addr, saddr, limit
+        before = _int_param(params, "before", None) if "before" in params else None
+        if before is not None and before < 1:
+            before = None
+        rows, has_more = self.server.db.staker_rewards_before(
+            self.server.cfg.validator_addr, saddr, limit, before
         )
-        return {"rewards": [_reward_json(r) for r in rows]}
+        return {"rewards": [_reward_json(r) for r in rows], "has_more": has_more}
 
     # ------------------------------------------------------------------ helpers
 
@@ -152,7 +165,6 @@ class Handler(BaseHTTPRequestHandler):
             return {"kind": "health", "params": params}
         if path_only == "/api/verify":
             return {"kind": "verify", "params": params}
-
         def unq(s):
             return urllib.parse.unquote(s)
 
@@ -170,7 +182,9 @@ class Handler(BaseHTTPRequestHandler):
             r"^/api/validators/(?P<vaddr>[^/]+)/cycles$", path_only
         )
         if m:
-            return {"kind": "cycles", "params": {"vaddr": unq(m.group("vaddr"))}}
+            merged = dict(params)
+            merged.update({"vaddr": unq(m.group("vaddr"))})
+            return {"kind": "cycles", "params": merged}
         m = re.match(
             r"^/api/validators/(?P<vaddr>[^/]+)/cycles/(?P<cid>[0-9]+)/shares$",
             path_only,
@@ -185,10 +199,12 @@ class Handler(BaseHTTPRequestHandler):
             path_only,
         )
         if m:
-            return {
-                "kind": "rewards",
-                "params": {"vaddr": unq(m.group("vaddr")), "saddr": unq(m.group("saddr"))},
-            }
+            merged = dict(params)
+            merged.update({
+                "vaddr": unq(m.group("vaddr")),
+                "saddr": unq(m.group("saddr")),
+            })
+            return {"kind": "rewards", "params": merged}
         return None
 
     def _send_json(self, status, obj):
