@@ -568,6 +568,130 @@ class VerifyTest(unittest.TestCase):
             db.close()
             fake.close()
 
+    def test_skipped_zero_income_short_window(self):
+        # Regression for the ImpactZero 739/740 MISMATCH pair. Sequence:
+        # pass 1 opens a cycle; pass 2 closes it cleanly (coinbase + full burst
+        # inside the window) AND ingests the first tx of the NEXT burst at block
+        # 113, so _open_pending_cycle anchors the next cycle at 113; pass 3
+        # ingests the burst's remaining tx at 114 -> the new window (113, 114]
+        # is 1 block long and contains payouts but no coinbase (a coinbase
+        # lands every 60 blocks, and the anchor landed mid-burst). available ==
+        # 0 makes expected == 0 for every staker, so Guard 5 used to MISMATCH
+        # every paid staker as "possible external top-up". There is nothing to
+        # verify in such a slice: close SKIPPED, clear shares, credit nothing.
+        fake, db, cfg, jobs = base_env()
+        try:
+            stage_open_close(
+                fake,
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                    staker_row(STAKER_C, 30000000),
+                ],
+                [
+                    staker_row(STAKER_A, 40000000 + EXP_A),
+                    staker_row(STAKER_B, 30000000 + EXP_B),
+                    staker_row(STAKER_C, 30000000 + EXP_C),
+                ],
+            )
+            fake.set_staged_txs([
+                # pass 1: nothing yet
+                [],
+                # pass 2: coinbase funding cycle 1 + its closing burst
+                # (100-102, > 10 blocks before the split tx at 113 so the batch
+                # detector keeps them separate)
+                [
+                    coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0"),
+                    *spread_staking_txs([EXP_A, EXP_B, EXP_C], 100, gap=1),
+                    staking_tx(113, 1000, "tx-113"),
+                ],
+                # pass 3: the rest of the split burst lands the NEXT ingest
+                # round, after the cycle anchor already moved to 113
+                [staking_tx(114, 500000, "tx-114")],
+            ])
+            fake.set_staged_stakers([
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                    staker_row(STAKER_C, 30000000),
+                ],
+                [
+                    staker_row(STAKER_A, 40000000 + EXP_A),
+                    staker_row(STAKER_B, 30000000 + EXP_B),
+                    staker_row(STAKER_C, 30000000 + EXP_C),
+                ],
+                [
+                    staker_row(STAKER_A, 40000000 + EXP_A),
+                    staker_row(STAKER_B, 30000000 + EXP_B),
+                    staker_row(STAKER_C, 30000000 + EXP_C),
+                ],
+            ])
+            run_two_pass(jobs)
+            run_pass(jobs)
+
+            cycles = closed_cycle(db)
+            self.assertEqual(len(cycles), 2)
+            # Newest first: the skipped slice, then the verified funding cycle.
+            skipped, funded = cycles[0], cycles[1]
+            self.assertEqual(skipped["status"], "SKIPPED")
+            # 113 -> 114: one block, a coinbase cannot fit inside.
+            self.assertEqual(skipped["available_luna"], 0)
+            self.assertLess(
+                skipped["closed_block"] - skipped["opened_block"], 60
+            )
+            self.assertEqual(funded["status"], "VERIFIED")
+            self.assertEqual(funded["available_luna"], AVAILABLE)
+            self.assertEqual(funded["closed_block"], 102)
+
+            # No per-staker verdicts and no G1 credits for the skipped slice;
+            # the funded cycle credited normally at its closing block.
+            self.assertEqual(db.cycle_shares(skipped["id"]), [])
+            for addr in (STAKER_A, STAKER_B, STAKER_C):
+                rewards = db.staker_rewards(VALIDATOR, addr, 50)
+                self.assertEqual(len(rewards), 1)
+                self.assertEqual(rewards[0]["block"], 102)
+        finally:
+            db.close()
+            fake.close()
+
+    def test_no_income_full_window_still_mismatch(self):
+        # A window >= 60 blocks with payouts but no coinbase is NOT a boundary
+        # artifact: the operator paid out money with no earnings in a full
+        # window. That must remain MISMATCH, never SKIPPED.
+        fake, db, cfg, jobs = base_env()
+        try:
+            stage_open_close(
+                fake,
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                    staker_row(STAKER_C, 30000000),
+                ],
+                [
+                    staker_row(STAKER_A, 40000000 + EXP_A),
+                    staker_row(STAKER_B, 30000000 + EXP_B),
+                    staker_row(STAKER_C, 30000000 + EXP_C),
+                ],
+            )
+            # Pass 1 opens the cycle with nothing; pass 2 brings a closing
+            # burst at 100-102 with NO coinbase anywhere in the window.
+            fake.set_staged_txs([
+                [],
+                spread_staking_txs([EXP_A, EXP_B, EXP_C], 100, gap=1),
+            ])
+            run_two_pass(jobs)
+
+            cycles = closed_cycle(db)
+            self.assertEqual(len(cycles), 1)
+            self.assertEqual(cycles[0]["status"], "MISMATCH")
+            self.assertEqual(cycles[0]["available_luna"], 0)
+            self.assertGreaterEqual(
+                cycles[0]["closed_block"] - cycles[0]["opened_block"], 60
+            )
+        finally:
+            db.close()
+            fake.close()
+
     def test_batch_gap_splits_batches(self):
         # Two bursts separated by more than BATCH_GAP_BLOCKS form two separate
         # cycles, each closing on its own batch end.
