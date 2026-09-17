@@ -1,0 +1,345 @@
+"""SQLite persistence layer for the Nimiq Staking Rewards Tracker.
+
+Uses WAL mode for concurrency between the scheduler thread and the read-only
+HTTP API thread. All writes are idempotent upserts. Money values are integer
+lunas throughout (1 NIM = 1e5 lunas).
+"""
+
+import os
+import sqlite3
+import time
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+  k TEXT PRIMARY KEY,
+  v TEXT
+);
+
+CREATE TABLE IF NOT EXISTS validator_snapshots (
+  validator TEXT,
+  fetched_at_ms INTEGER,
+  total_luna INTEGER,
+  num_stakers INTEGER,
+  deposit_luna INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS staker_snapshots (
+  validator TEXT,
+  address TEXT,
+  fetched_at_ms INTEGER,
+  balance_luna INTEGER,
+  inactive_luna INTEGER,
+  PRIMARY KEY (validator, address, fetched_at_ms)
+);
+
+CREATE TABLE IF NOT EXISTS rewards (
+  validator TEXT,
+  block INTEGER,
+  amount_luna INTEGER,
+  ts_ms INTEGER,
+  tx_hash TEXT,
+  PRIMARY KEY (validator, block)
+);
+
+CREATE TABLE IF NOT EXISTS cycles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  validator TEXT,
+  opened_block INTEGER,
+  closed_block INTEGER,
+  available_luna INTEGER,
+  reserve_luna INTEGER,
+  held_luna INTEGER DEFAULT 0,
+  total_luna INTEGER,
+  status TEXT CHECK (status IN ('PENDING','VERIFIED','MISMATCH')),
+  opened_at_ms INTEGER,
+  closed_at_ms INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS cycle_shares (
+  cycle_id INTEGER REFERENCES cycles(id),
+  staker_address TEXT,
+  expected_luna INTEGER,
+  actual_luna INTEGER,
+  tx_hash TEXT,
+  ok INTEGER,
+  PRIMARY KEY (cycle_id, staker_address)
+);
+
+CREATE TABLE IF NOT EXISTS staker_rewards (
+  staker_address TEXT,
+  block INTEGER,
+  amount_luna INTEGER,
+  tx_hash TEXT,
+  ts_ms INTEGER,
+  PRIMARY KEY (staker_address, block, tx_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_staker_rewards_addr
+  ON staker_rewards(staker_address, ts_ms);
+
+CREATE TABLE IF NOT EXISTS restake_txs (
+  validator TEXT, block INTEGER, to_addr TEXT, amount_luna INTEGER, ts_ms INTEGER,
+  tx_hash TEXT, PRIMARY KEY (validator, block, to_addr, tx_hash)
+);
+"""
+
+
+class DB:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        parent = os.path.dirname(db_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.executescript(SCHEMA)
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+    # ---- meta ----
+
+    def set_meta(self, key, value):
+        self.conn.execute(
+            "INSERT INTO meta(k, v) VALUES(?, ?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            (key, str(value)),
+        )
+        self.conn.commit()
+
+    def get_meta(self, key):
+        row = self.conn.execute(
+            "SELECT v FROM meta WHERE k=?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        return row["v"]
+
+    # ---- validator snapshots ----
+
+    def upsert_validator_snapshot(self, validator, fetched_at_ms, total_luna,
+                                  num_stakers, deposit_luna):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO validator_snapshots "
+            "(validator, fetched_at_ms, total_luna, num_stakers, deposit_luna) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (validator, fetched_at_ms, total_luna, num_stakers, deposit_luna),
+        )
+        self.conn.commit()
+
+    def latest_validator_snapshot(self, validator):
+        row = self.conn.execute(
+            "SELECT * FROM validator_snapshots WHERE validator=? "
+            "ORDER BY fetched_at_ms DESC LIMIT 1",
+            (validator,),
+        ).fetchone()
+        return row
+
+    # ---- staker snapshots ----
+
+    def upsert_staker_snapshot(self, validator, address, fetched_at_ms,
+                              balance_luna, inactive_luna):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO staker_snapshots "
+            "(validator, address, fetched_at_ms, balance_luna, inactive_luna) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (validator, address, fetched_at_ms, balance_luna, inactive_luna),
+        )
+        self.conn.commit()
+
+    def staker_snapshot_at(self, validator, address, at_ms):
+        """Return the latest snapshot for (validator, address) at or before
+        at_ms, or None."""
+        row = self.conn.execute(
+            "SELECT * FROM staker_snapshots WHERE validator=? AND address=? "
+            "AND fetched_at_ms <= ? ORDER BY fetched_at_ms DESC LIMIT 1",
+            (validator, address, at_ms),
+        ).fetchone()
+        return row
+
+    def latest_staker_rows(self, validator):
+        """Latest snapshot per staker address, ordered by balance desc."""
+        rows = self.conn.execute(
+            "SELECT s1.* FROM staker_snapshots s1 "
+            "JOIN (SELECT address, MAX(fetched_at_ms) AS m FROM staker_snapshots "
+            "      WHERE validator=? GROUP BY address) s2 "
+            "ON s1.address = s2.address AND s1.fetched_at_ms = s2.m "
+            "WHERE s1.validator=? ORDER BY s1.balance_luna DESC",
+            (validator, validator),
+        ).fetchall()
+        return rows
+
+    # ---- rewards ----
+
+    def upsert_reward(self, validator, block, amount_luna, ts_ms, tx_hash):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO rewards "
+            "(validator, block, amount_luna, ts_ms, tx_hash) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (validator, block, amount_luna, ts_ms, tx_hash),
+        )
+        self.conn.commit()
+
+    def rewards_in_window(self, validator, start_block, end_block):
+        """Rewards with start_block < block <= end_block."""
+        rows = self.conn.execute(
+            "SELECT * FROM rewards WHERE validator=? AND block>? AND block<=? "
+            "ORDER BY block ASC",
+            (validator, start_block, end_block),
+        ).fetchall()
+        return rows
+
+    def first_last_rewards(self, validator):
+        row = self.conn.execute(
+            "SELECT MIN(ts_ms) AS first_ts, MAX(ts_ms) AS last_ts, "
+            "COUNT(*) AS n FROM rewards WHERE validator=?",
+            (validator,),
+        ).fetchone()
+        return row
+
+    def rewards_since(self, validator, since_block):
+        rows = self.conn.execute(
+            "SELECT * FROM rewards WHERE validator=? AND block>=? ORDER BY block ASC",
+            (validator, since_block),
+        ).fetchall()
+        return rows
+
+    # ---- cycles ----
+
+    def create_cycle(self, validator, opened_block, opened_at_ms, total_luna,
+                     reserve_luna):
+        cur = self.conn.execute(
+            "INSERT INTO cycles "
+            "(validator, opened_block, opened_at_ms, total_luna, reserve_luna, status) "
+            "VALUES (?, ?, ?, ?, ?, 'PENDING')",
+            (validator, opened_block, opened_at_ms, total_luna, reserve_luna),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def latest_pending_cycle(self, validator):
+        row = self.conn.execute(
+            "SELECT * FROM cycles WHERE validator=? AND status='PENDING' "
+            "ORDER BY id DESC LIMIT 1",
+            (validator,),
+        ).fetchone()
+        return row
+
+    def latest_closed_cycle(self, validator):
+        row = self.conn.execute(
+            "SELECT * FROM cycles WHERE validator=? AND status IN "
+            "('VERIFIED','MISMATCH') ORDER BY id DESC LIMIT 1",
+            (validator,),
+        ).fetchone()
+        return row
+
+    def close_cycle(self, cycle_id, closed_block, closed_at_ms, available_luna,
+                    held_luna, status):
+        self.conn.execute(
+            "UPDATE cycles SET closed_block=?, closed_at_ms=?, available_luna=?, "
+            "held_luna=?, status=? WHERE id=?",
+            (closed_block, closed_at_ms, available_luna, held_luna, status, cycle_id),
+        )
+        self.conn.commit()
+
+    def get_cycle(self, cycle_id):
+        row = self.conn.execute(
+            "SELECT * FROM cycles WHERE id=?", (cycle_id,)
+        ).fetchone()
+        return row
+
+    def recent_cycles(self, validator, limit):
+        rows = self.conn.execute(
+            "SELECT * FROM cycles WHERE validator=? "
+            "ORDER BY id DESC LIMIT ?",
+            (validator, limit),
+        ).fetchall()
+        return rows
+
+    # ---- cycle shares ----
+
+    def upsert_cycle_share(self, cycle_id, staker_address, expected_luna,
+                           actual_luna, tx_hash, ok):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO cycle_shares "
+            "(cycle_id, staker_address, expected_luna, actual_luna, tx_hash, ok) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (cycle_id, staker_address, expected_luna, actual_luna, tx_hash, ok),
+        )
+        self.conn.commit()
+
+    def clear_cycle_shares(self, cycle_id):
+        self.conn.execute(
+            "DELETE FROM cycle_shares WHERE cycle_id=?", (cycle_id,)
+        )
+        self.conn.commit()
+
+    def cycle_shares(self, cycle_id):
+        rows = self.conn.execute(
+            "SELECT * FROM cycle_shares WHERE cycle_id=? ORDER BY staker_address ASC",
+            (cycle_id,),
+        ).fetchall()
+        return rows
+
+    # ---- staker rewards (G1 ledger) ----
+
+    def upsert_staker_reward(self, staker_address, block, amount_luna, tx_hash,
+                             ts_ms):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO staker_rewards "
+            "(staker_address, block, amount_luna, tx_hash, ts_ms) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (staker_address, block, amount_luna, tx_hash, ts_ms),
+        )
+        self.conn.commit()
+
+    def staker_rewards(self, validator, address, limit):
+        rows = self.conn.execute(
+            "SELECT * FROM staker_rewards WHERE staker_address=? "
+            "ORDER BY ts_ms DESC LIMIT ?",
+            (address, limit),
+        ).fetchall()
+        return rows
+
+    # ---- restake txs ----
+
+    def upsert_restake(self, validator, block, to_addr, amount_luna, ts_ms, tx_hash):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO restake_txs "
+            "(validator, block, to_addr, amount_luna, ts_ms, tx_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (validator, block, to_addr, amount_luna, ts_ms, tx_hash),
+        )
+        self.conn.commit()
+
+    def first_restake_after(self, validator, block):
+        row = self.conn.execute(
+            "SELECT * FROM restake_txs WHERE validator=? AND block>? "
+            "ORDER BY block ASC LIMIT 1",
+            (validator, block),
+        ).fetchone()
+        return row
+
+    def restakes_in_window(self, validator, start_block, end_block):
+        """Restakes with start_block < block <= end_block (closing batch inclusive)."""
+        rows = self.conn.execute(
+            "SELECT * FROM restake_txs WHERE validator=? AND block>? AND block<=? "
+            "ORDER BY block ASC",
+            (validator, start_block, end_block),
+        ).fetchall()
+        return rows
+
+    def max_restake_block(self, validator):
+        row = self.conn.execute(
+            "SELECT MAX(block) AS m FROM restake_txs WHERE validator=?",
+            (validator,),
+        ).fetchone()
+        return int(row["m"]) if row and row["m"] is not None else 0
+
+    # ---- misc ----
+
+    def _now_ms(self):
+        return int(time.time() * 1000)

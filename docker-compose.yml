@@ -1,0 +1,23 @@
+services:
+  tracker:
+    build: .
+    image: nimiq-staking-rewards-tracker:latest
+    container_name: nimiq-staking-rewards-tracker
+    ports:
+      - "127.0.0.1:8649:8649"
+    volumes:
+      - ./data:/data
+    environment:
+      - RPC_URL=${RPC_URL:-https://rpc.nimiqwatch.com}
+      - STAKERS_URL_TEMPLATE=${STAKERS_URL_TEMPLATE:-https://nimiq-api.subimpact.net/api/stakers/{address}}
+      - VALIDATORS_URL_TEMPLATE=${VALIDATORS_URL_TEMPLATE:-https://nimiq-api.subimpact.net/api/validators}
+      - VALIDATOR_ADDR=${VALIDATOR_ADDR:-NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY}
+      - REWARD_ADDR=${REWARD_ADDR:-NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY}
+      - MIN_TRIGGER_LUNA=${MIN_TRIGGER_LUNA:-2000}
+      - MIN_SHARE_LUNA=${MIN_SHARE_LUNA:-500}
+      - RESERVE_LUNA=${RESERVE_LUNA:-100000}
+      - DATA_DIR=/data
+      - PORT=8649
+      - POLL_SECONDS=${POLL_SECONDS:-60}
+      - LOG_FILE=${LOG_FILE:-}
+    restart: unless-stopped
