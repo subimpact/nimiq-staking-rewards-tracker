@@ -154,8 +154,14 @@ def restake_tx(block, to_addr, value_luna, tx_hash):
     }
 
 
-def staking_tx(block, value_luna, tx_hash):
-    return restake_tx(block, STAKING_CONTRACT_ADDR, value_luna, tx_hash)
+def staking_tx(block, value_luna, tx_hash, staker=None):
+    """AddStake tx to the staking contract. When `staker` is given, the tx
+    carries relatedAddresses naming the credited staker (mimics the explorer
+    RPC), which is what the verifier uses for per-staker tx attribution."""
+    tx = restake_tx(block, STAKING_CONTRACT_ADDR, value_luna, tx_hash)
+    if staker:
+        tx["relatedAddresses"] = [REWARD_ADDR, STAKING_CONTRACT_ADDR, staker]
+    return tx
 
 
 def spread_staking_txs(amounts, start_block, gap=1):

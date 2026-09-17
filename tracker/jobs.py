@@ -20,7 +20,7 @@ import json
 import time
 import urllib.request
 
-from tracker.config import COINBASE_ADDR
+from tracker.config import COINBASE_ADDR, STAKING_CONTRACT_ADDR
 
 MAX_TX_BATCH = 200
 
@@ -102,6 +102,28 @@ def _tx_hash(tx):
     return tx.get("hash") or ""
 
 
+def _tx_related(tx):
+    """On-chain staker attribution for an outbound restake: the explorer's
+    relatedAddresses names every party of the tx — for an AddStake the staker
+    being credited is listed alongside the validator and the staking contract.
+    Absent or empty means the endpoint did not expose the mapping (fail-open:
+    the verifier falls back to balance-delta math and the boundary hash)."""
+    return tx.get("relatedAddresses") or tx.get("related") or []
+
+
+def _staker_from_related(tx, validator_addr, contract_addr):
+    """The explorer returns addresses spaced ('NQ27 NCB1 ...'); keep the third
+    party's address exactly as sent so it matches the spaced addresses stored
+    in the snapshot tables."""
+    related = [str(a) for a in _tx_related(tx)]
+    v = validator_addr.replace(" ", "")
+    c = contract_addr.replace(" ", "")
+    for a in related:
+        if a and a.replace(" ", "") not in (v, c):
+            return a
+    return ""
+
+
 class Jobs:
     def __init__(self, db, cfg, fetcher=None, now_ms=None):
         self.db = db
@@ -181,8 +203,9 @@ class Jobs:
 
             # Outbound from the reward address -> restake.
             if sender == self.cfg.reward_addr and recipient:
+                staker = _staker_from_related(tx, self.cfg.validator_addr, STAKING_CONTRACT_ADDR)
                 self.db.upsert_restake(
-                    self.cfg.validator_addr, block, recipient, value, ts, tx_hash
+                    self.cfg.validator_addr, block, recipient, value, ts, tx_hash, staker
                 )
                 continue
 
@@ -292,6 +315,14 @@ class Jobs:
         all_ok = True
         sum_delta = 0
         expected_total = 0
+        # Per-staker proof: when the explorer named the credited staker in
+        # relatedAddresses, each share carries that real AddStake tx hash;
+        # otherwise the boundary batch hash remains the stand-in. Keys are
+        # normalized (case/whitespace) because RPC implementations vary.
+        staker_hash_map = {}
+        for r in window:
+            if r["staker_address"]:
+                staker_hash_map[r["staker_address"].replace(" ", "").upper()] = r["tx_hash"]
         # Denominator = sum of staker ledger balances at cycle open, matching
         # what the payout engine actually distributes against (its validator
         # balance excludes the 100k deposit, so the deposit's earned slice is
@@ -328,7 +359,8 @@ class Jobs:
                 reason = ""
             all_ok = all_ok and ok
             self.db.upsert_cycle_share(
-                pending["id"], addr, expected, actual, boundary_hash,
+                pending["id"], addr, expected, actual,
+                staker_hash_map.get(addr.replace(" ", "").upper()) or boundary_hash,
                 1 if ok else 0, reason,
             )
 
@@ -369,16 +401,17 @@ class Jobs:
                     share["tx_hash"], share["ok"], reason,
                 )
 
-        # G1 ledger (guard 7): credited amounts for ok stakers. The AddStake
-        # payload cannot be decoded without raw txs, so the boundary batch hash
-        # stands in for the credit's tx_hash.
+        # G1 ledger (guard 7): credited amounts for ok stakers. tx_hash is the
+        # staker's real AddStake hash when the explorer named them in
+        # relatedAddresses; the boundary batch hash stands in only when the
+        # endpoint did not expose the mapping.
         for share in self.db.cycle_shares(pending["id"]):
             if not share["ok"]:
                 continue
             credited = int(share["actual_luna"])
-            self.db.upsert_staker_reward(
+            self.db.credit_staker_reward(
                 share["staker_address"], closed_block, credited,
-                boundary_hash, closed_at_ms,
+                share["tx_hash"], closed_at_ms,
             )
 
         self._open_pending_cycle()
@@ -413,7 +446,7 @@ class Jobs:
             for share in shares:
                 if not share["ok"]:
                     continue
-                self.db.upsert_staker_reward(
+                self.db.credit_staker_reward(
                     share["staker_address"], latest["closed_block"],
                     int(share["actual_luna"]), share["tx_hash"], self._now_ms(),
                 )
