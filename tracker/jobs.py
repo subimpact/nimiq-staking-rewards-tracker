@@ -101,15 +101,14 @@ def _tx_hash(tx):
 
 
 class Jobs:
-    def __init__(self, db, cfg, fetcher=None):
+    def __init__(self, db, cfg, fetcher=None, now_ms=None):
         self.db = db
         self.cfg = cfg
         self.fetcher = fetcher if fetcher is not None else LiveFetcher(cfg)
-
-    # ------------------------------------------------------------------ utils
-
-    def _now_ms(self):
-        return int(time.time() * 1000)
+        # Monotonic clock injection: tests pass a counter so consecutive
+        # snapshots never share a millisecond (same-ms timestamps made the
+        # strict-after snapshot lookup flaky).
+        self._now_ms = now_ms or (lambda: int(time.time() * 1000))
 
     def _latest_validator_total(self):
         row = self.db.latest_validator_snapshot(self.cfg.validator_addr)

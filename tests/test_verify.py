@@ -61,7 +61,15 @@ def base_env():
     fake.set_validator(TOTAL_LUNA, 3)
     cfg = build_config(fake)
     db = DB(os.path.join(fake.data_dir, "tracker.db"))
-    jobs = Jobs(db, cfg, fetcher=_FakeFetcher(cfg, fake))
+    # Monotonic clock: each timestamp is strictly increasing, so the
+    # strict-after snapshot lookup can never miss due to same-ms writes.
+    counter = {"ms": 1_700_000_000_000}
+
+    def now_ms():
+        counter["ms"] += 1
+        return counter["ms"]
+
+    jobs = Jobs(db, cfg, fetcher=_FakeFetcher(cfg, fake), now_ms=now_ms)
     return fake, db, cfg, jobs
 
 
