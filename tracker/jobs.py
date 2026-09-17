@@ -61,7 +61,10 @@ class LiveFetcher:
             return json.loads(resp.read().decode("utf-8"))
 
     def get_transactions(self, address):
-        return self._rpc("getTransactionsByAddress", [address, MAX_TX_BATCH, None])
+        res = self._rpc("getTransactionsByAddress", [address, MAX_TX_BATCH, None])
+        if isinstance(res, dict):
+            return res.get("data") or []
+        return res or []
 
     def get_stakers(self):
         return self._get(self.cfg.stakers_url())
@@ -132,21 +135,33 @@ class Jobs:
         stakers_payload = self.fetcher.get_stakers()
 
         vrow = _first_payload(validator_payload)
-        total_luna = int(vrow.get("total") or vrow.get("totalStake") or 0)
+        total_luna = int(vrow.get("balance") or vrow.get("total") or vrow.get("totalStake") or 0)
         num_stakers = int(vrow.get("numStakers") or vrow.get("stakerCount") or 0)
         deposit_luna = int(vrow.get("deposit") or vrow.get("validatorDeposit") or 0)
         self.db.upsert_validator_snapshot(
             self.cfg.validator_addr, now, total_luna, num_stakers, deposit_luna
         )
 
+        staker_sum = 0
+        staker_count = 0
         for srow in _list_payload(stakers_payload):
             address = srow.get("address")
             if not address:
                 continue
             balance = int(srow.get("balance") or 0)
             inactive = int(srow.get("inactiveBalance") or 0)
+            staker_sum += balance
+            staker_count += 1
             self.db.upsert_staker_snapshot(
                 self.cfg.validator_addr, address, now, balance, inactive
+            )
+
+        # Deposit is not exposed by the API; derive it as total minus the sum
+        # of staker records when both are present (100000 NIM when known).
+        if deposit_luna == 0 and total_luna > 0 and staker_sum > 0:
+            deposit_luna = max(total_luna - staker_sum, 0)
+            self.db.upsert_validator_snapshot(
+                self.cfg.validator_addr, now, total_luna, staker_count, deposit_luna
             )
 
     # ------------------------------------------------------------------- job 2
