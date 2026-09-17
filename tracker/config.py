@@ -6,6 +6,7 @@ written back out.
 """
 
 import os
+from urllib.parse import quote
 
 DEFAULT_RPC_URL = "https://rpc.nimiqwatch.com"
 DEFAULT_STAKERS_URL_TEMPLATE = "https://nimiq-api.subimpact.net/api/stakers/{address}"
@@ -55,7 +56,7 @@ class Config:
         return os.path.join(self.data_dir, "tracker.db")
 
     def stakers_url(self):
-        return self.stakers_url_template.format(address=self.reward_addr)
+        return self.stakers_url_template.format(address=quote(self.reward_addr))
 
     def validators_url(self):
         return self.validators_url_template
