@@ -86,9 +86,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _verify(self, params):
         limit = _int_param(params, "limit", 50)
-        before = _int_param(params, "before", None) if "before" in params else None
-        if before is not None and before < 1:
-            before = None
+        before = _before_param(params, "before")
         rows, has_more = self.server.db.recent_cycles_before(
             self.server.cfg.validator_addr, limit, before
         )
@@ -119,9 +117,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _cycles(self, vaddr, params):
         limit = _int_param(params, "limit", 50)
-        before = _int_param(params, "before", None) if "before" in params else None
-        if before is not None and before < 1:
-            before = None
+        before = _before_param(params, "before")
         rows, has_more = self.server.db.recent_cycles_before(
             vaddr, limit, before
         )
@@ -140,9 +136,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _rewards(self, saddr, params):
         limit = _int_param(params, "limit", 50)
-        before = _int_param(params, "before", None) if "before" in params else None
-        if before is not None and before < 1:
-            before = None
+        before = _before_param(params, "before")
         rows, has_more = self.server.db.staker_rewards_before(
             self.server.cfg.validator_addr, saddr, limit, before
         )
@@ -224,6 +218,19 @@ def _int_param(params, key, default):
         return max(1, min(int(val), 500))
     except ValueError:
         return default
+
+
+def _before_param(params, key):
+    """Cursor parser: unlike _int_param this is NOT clamped to 500. Blocks and
+    cycle ids are ~61 million on Albatross; clamping the cursor to 500 made
+    every second page come back empty (regression caught on live data)."""
+    val = _query(params, key, None)
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
 
 
 def _row_dict(row):

@@ -169,6 +169,25 @@ class ApiTest(unittest.TestCase):
         self.assertEqual([r["block"] for r in p3["rewards"]], [400])
         self.assertFalse(p3["has_more"])
 
+    def test_rewards_before_cursor_large_blocks(self):
+        """Regression: _int_param clamped `before` to 500, but real Albatross
+        block numbers are ~61M, so every page-2 request came back empty.
+        Cursor parsing must NOT go through the 500 clamp."""
+        # Blocks in the 61M range, straddling the old clamp.
+        big = 61_800_000
+        for i in range(5):
+            self.db.upsert_staker_reward(STAKER_C, big + i, 300000 + i, "tx-%d" % i, 2000 + i)
+        status, p1 = self._get(
+            "/api/validators/%s/stakers/%s/rewards?limit=2" % (VALIDATOR, STAKER_C)
+        )
+        self.assertEqual([r["block"] for r in p1["rewards"]], [big + 4, big + 3])
+        status, p2 = self._get(
+            "/api/validators/%s/stakers/%s/rewards?limit=2&before=%d" % (VALIDATOR, STAKER_C, big + 3)
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([r["block"] for r in p2["rewards"]], [big + 2, big + 1])
+        self.assertTrue(p2["has_more"])
+
     def test_cycles_has_more_and_before(self):
         # 1 seeded cycle + 2 here = 3 total.
         cid2 = self.db.create_cycle(VALIDATOR, 300, 300000, 100000000, RESERVE)
