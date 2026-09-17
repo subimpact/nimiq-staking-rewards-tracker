@@ -8,7 +8,9 @@ Cycle model (deterministic, integer-only):
   - The window of a cycle is [opened_block, closed_block): a cycle is closed
     when a new restake transaction appears at a block strictly greater than the
     cycle's opened_block.
-  - available_luna = sum(rewards in window) - reserve_luna - held_luna.
+  - available_luna = sum(rewards in window) - held_luna. reserve_luna is a
+    wallet safety floor (keep ~1 NIM for fees/rounding), NOT a per-cycle
+    deduction from the distributable amount; it is recorded for reference only.
   - total_luna = the validator's latest snapshot at window open.
   - expected_i = floor(balance_i * available_luna / total_luna).
   - actual_i = sum of per-staker restakes inside the window.
@@ -224,7 +226,13 @@ class Jobs:
         rewards = self.db.rewards_in_window(
             self.cfg.validator_addr, opened_block, closed_block
         )
-        available = _sum_ints(r["amount_luna"] for r in rewards) - self.cfg.reserve_luna
+        # available = full coinbase sum in the window. reserve_luna is a wallet
+        # safety floor, NOT a per-cycle deduction from what the bot distributes:
+        # the bot pays out the whole reward (plus/minus dust), so carving the
+        # reserve here would make every expected share lower than actual and
+        # trip guard 5 for every staker. held stays as-is (0 in practice).
+        sum_rewards = _sum_ints(r["amount_luna"] for r in rewards)
+        available = sum_rewards
         held = int(pending["held_luna"])
         available -= held
         if available < 0:
@@ -309,10 +317,19 @@ class Jobs:
                 1 if ok else 0, reason,
             )
 
-        # Guard 4: self-consistency check against the on-chain restake value.
+        # Guard 4a: internal consistency of the attribution. The sum of on-chain
+        # restakes must match the sum of attributed deltas plus any unaccounted
+        # (restaked) value within 1 luna, else the window was mis-windowed.
         sum_txs = _sum_ints(r["amount_luna"] for r in window)
         drift = abs(sum_txs - (sum_delta + unaccounted)) > 1
-        if drift:
+
+        # Guard 4b: honesty against the cycle's actual reward income. The bot
+        # distributes what it earns (within dust); if the batch sum is far from
+        # the coinbase sum in the same window, the operator is skimming while
+        # staying internally proportional.
+        skim = abs(sum_txs - sum_rewards) > self.cfg.dust_tolerance_luna
+
+        if drift or skim:
             status = "MISMATCH"
         else:
             status = "VERIFIED" if all_ok else "MISMATCH"
@@ -322,16 +339,19 @@ class Jobs:
             pending["id"], closed_block, closed_at_ms, available, held, status
         )
 
-        # Surface the drift reason on shares that have none yet.
-        if drift:
-            drift_reason = "unaccounted restake value (possible timing drift)"
+        # Surface the drift/skim reasons on shares that have none yet.
+        if drift or skim:
+            if drift:
+                reason = "unaccounted restake value (possible timing drift)"
+            else:
+                reason = "distribution does not match cycle rewards (possible skim)"
             for share in self.db.cycle_shares(pending["id"]):
                 if share["reason"]:
                     continue
                 self.db.upsert_cycle_share(
                     pending["id"], share["staker_address"],
                     share["expected_luna"], share["actual_luna"],
-                    share["tx_hash"], share["ok"], drift_reason,
+                    share["tx_hash"], share["ok"], reason,
                 )
 
         # G1 ledger (guard 7): credited amounts for ok stakers. The AddStake

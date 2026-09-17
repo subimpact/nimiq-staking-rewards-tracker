@@ -19,7 +19,7 @@ Reference deployment: ImpactZero (NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY),
   - `STAKERS_URL_TEMPLATE` (default `https://nimiq-api.subimpact.net/api/stakers/{address}`) — latest staker records (`{data: [{address, balance, delegation, inactiveBalance, ...}]}`). Configurable so other validators can point at their own API.
   - `VALIDATORS_URL_TEMPLATE` (default `https://nimiq-api.subimpact.net/api/validators`) — validator record for total stake + staker count.
   - Optional `LOG_FILE` (e.g. host-mounted `/logs/restake.log`, read-only) for cycle boundary markers from the operator's restake bot; purely informational — verification data comes from the chain.
-- Config via env vars (see README section below); all thresholds mirror the ImpactZero restake bot: `MIN_TRIGGER_LUNA=2000`, `MIN_SHARE_LUNA=500`, `RESERVE_LUNA=100000`, `REWARD_ADDR`, `VALIDATOR_ADDR`.
+- Config via env vars (see README section below); all thresholds mirror the ImpactZero restake bot: `MIN_TRIGGER_LUNA=2000`, `MIN_SHARE_LUNA=500`, `RESERVE_LUNA=100000` (wallet floor, informational only), `DUST_TOLERANCE_LUNA=500`, `REWARD_ADDR`, `VALIDATOR_ADDR`.
 
 ## SQLite schema
 
@@ -63,12 +63,15 @@ CREATE INDEX idx_staker_rewards_addr ON staker_rewards(staker_address, ts_ms);
    - from the validator reward address to the staking contract (`NQ77 0000 ... 0000 0001`) → restake tx (record in a `restake_txs`-style table if present; at minimum used in job 4);
    - anything else → ignore (sentinel domain of the bot; not ours).
    Dedup by block/hash.
-3. **cycle close**: a "cycle" = the window between consecutive restake batches from the reward wallet. When new restake txs are seen (and the previous window has a `PENDING` cycle), close it: `available_luna` = rewards inside window − `RESERVE_LUNA` − `HELD`; `total_luna` = validator snapshot at window open; recompute shares with **job 4**, set `VERIFIED`/`MISMATCH`.
+3. **cycle close**: a "cycle" = the window between consecutive restake batches from the reward wallet. When new restake txs are seen (and the previous window has a `PENDING` cycle), close it: `available_luna` = rewards inside window − `HELD` (`RESERVE_LUNA` is a wallet safety floor, not a per-cycle deduction; recorded for reference only); `total_luna` = validator snapshot at window open; recompute shares with **job 4**, set `VERIFIED`/`MISMATCH`.
 4. **verify (G2)**: for each staker snapshot taken at window open:
    `expected_i = floor(balance_i * available / total)` (integer lunas, deterministic);
    `actual_i` = sum of restake tx values to that staker inside the window.
    `ok = 1` when `actual_i == expected_i`, OR (`expected_i < MIN_SHARE_LUNA` AND `actual_i == 0`) (dust floor skips it), OR `abs(actual_i - expected_i) <= 1` (rounding tolerance).
-   Cycle status `VERIFIED` iff every line `ok`; else `MISMATCH` (per-line diff stored in `cycle_shares.expected/actual`).
+   Two independent consistency checks determine cycle status beyond the per-line `ok`:
+   - internal drift: `abs(sum_txs - (sum_deltas + unaccounted)) > 1` → MISMATCH, reason "unaccounted restake value (possible timing drift)";
+   - honesty vs reward income: `abs(sum_txs - sum_rewards_in_window) > DUST_TOLERANCE_LUNA` → MISMATCH, reason "distribution does not match cycle rewards (possible skim)".
+   Cycle status `VERIFIED` iff every line `ok` and neither consistency check fires; else `MISMATCH` (per-line diff stored in `cycle_shares.expected/actual`).
    Every verified/mismatched cycle lands in `staker_rewards` (the credited amounts) for G1.
 
 ## API (read-only, GET, JSON; errors `{"error": "..."}`)

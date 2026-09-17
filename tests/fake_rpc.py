@@ -9,6 +9,7 @@ from tracker.config import STAKING_CONTRACT_ADDR
 STAKER_A = "NQ01 AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA"
 STAKER_B = "NQ02 BBBB BBBB BBBB BBBB BBBB BBBB BBBB BBBB"
 STAKER_C = "NQ03 CCCC CCCC CCCC CCCC CCCC CCCC CCCC CCCC"
+STAKER_D = "NQ04 DDDD DDDD DDDD DDDD DDDD DDDD DDDD DDDD"
 VALIDATOR = "NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY"
 REWARD_ADDR = VALIDATOR
 
@@ -91,6 +92,21 @@ class FakeServer:
         if handler is not None:
             return handler()
         return self.stakers_payload
+
+    def set_staged_validators(self, stages):
+        """Serve one validator payload per get_validators call, in order. Mirrors
+        staker staging so validator total can grow as balances compound."""
+        queue = list(stages)
+
+        def handler():
+            return queue.pop(0) if queue else {"data": []}
+        self._staged_validators = handler
+
+    def validators_payload_now(self):
+        handler = getattr(self, "_staged_validators", None)
+        if handler is not None:
+            return handler()
+        return self.validators_payload
 
     def set_validator(self, total_luna, num_stakers, deposit_luna=0):
         self.validators_payload = {

@@ -22,6 +22,14 @@ STAKING_CONTRACT_ADDR = "NQ77 0000 0000 0000 0000 0000 0000 0000 0001"
 # a new distribution event (or a pause), so it splits batches.
 BATCH_GAP_BLOCKS = 10
 
+# Honesty-check tolerance (luna): the bot may sweep a few lunas of dust into the
+# batch or carry a couple of lunas across a cycle boundary, so the distributed
+# sum may differ from the window's coinbase sum by a small amount. 500 luna =
+# 0.005 NIM. A real skim (e.g. 5% of a 6 NIM reward = 30,000 luna) is far over
+# the line. This is independent of RESERVE_LUNA, which is a wallet safety floor
+# and is NOT deducted from the distributable amount.
+DUST_TOLERANCE_LUNA = 500
+
 
 def _get_int(env, name, default):
     raw = env.get(name)
@@ -52,6 +60,9 @@ class Config:
         self.min_trigger_luna = _get_int(env, "MIN_TRIGGER_LUNA", 2000)
         self.min_share_luna = _get_int(env, "MIN_SHARE_LUNA", 500)
         self.reserve_luna = _get_int(env, "RESERVE_LUNA", 100000)
+        self.dust_tolerance_luna = _get_int(
+            env, "DUST_TOLERANCE_LUNA", DUST_TOLERANCE_LUNA
+        )
         self.batch_gap_blocks = _get_int(env, "BATCH_GAP_BLOCKS", BATCH_GAP_BLOCKS)
         self.data_dir = _get_str(env, "DATA_DIR", "/data")
         self.port = _get_int(env, "PORT", 8649)
