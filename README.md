@@ -42,7 +42,7 @@ G2 is the verifier. For a closed cycle:
 - total = the validator's total stake at window open.
 - expected_i = floor(balance_i * available / total), all in integer lunas.
 - actual_i = sum of the restake values sent to that staker in the window.
-- A staker line is OK when actual_i equals expected_i, or when expected_i is below MIN_SHARE_LUNA and actual_i is zero (the dust floor skips it), or when abs(actual_i - expected_i) <= 1 (rounding tolerance).
+- A staker line is OK when actual_i equals expected_i, or when expected_i is below MIN_SHARE_LUNA and actual_i is zero (the bot's integer floor can round a dust share to zero), or when abs(actual_i - expected_i) <= 1 (rounding tolerance).
 
 The cycle is VERIFIED only when every staker line is OK; otherwise it is MISMATCH, with the per-line expected and actual stored in `cycle_shares`. A cycle is SKIPPED when its window is shorter than a block-reward interval (60 blocks) yet contains payouts: such a slice cannot contain the income that funds its payouts, so there is nothing to verify and no verdict is issued.
 

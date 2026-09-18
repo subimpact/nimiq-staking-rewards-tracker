@@ -371,11 +371,11 @@ class Jobs:
                 reason = reason_map[addr]
             elif actual > expected + self.cfg.dust_tolerance_luna:
                 # Guard 5: credit exceeds expected share by more than the dust
-                # noise floor. The bot skips dust shares (< MIN_SHARE) each
-                # cycle and sweeps the carry into later batches, and its live
-                # staker view lags our minute-snapshots by a few lunas, so a
-                # small overage is normal operating behavior. Anything beyond
-                # the tolerance is an external top-up or misallocation.
+                # noise floor. The bot pays every staker's proportional share
+                # each cycle (integer floor; only zero shares are skipped), and
+                # its live staker view lags our minute-snapshots by a few lunas,
+                # so a small overage is normal operating behavior. Anything
+                # beyond the tolerance is an external top-up or misallocation.
                 ok = False
                 reason = "credit exceeds expected share (possible external top-up)"
             else:
