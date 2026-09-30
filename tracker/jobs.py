@@ -128,6 +128,7 @@ class Jobs:
     def __init__(self, db, cfg, fetcher=None, now_ms=None):
         self.db = db
         self.cfg = cfg
+        self._last_closed_pending_id = None
         self.fetcher = fetcher if fetcher is not None else LiveFetcher(cfg)
         # Monotonic clock injection: tests pass a counter so consecutive
         # snapshots never share a millisecond (same-ms timestamps made the
@@ -161,10 +162,12 @@ class Jobs:
         # Write staker rows first so their sum is available for the deposit.
         staker_sum = 0
         staker_count = 0
+        present = set()
         for srow in _list_payload(stakers_payload):
             address = srow.get("address")
             if not address:
                 continue
+            present.add(address)
             balance = int(srow.get("balance") or 0)
             inactive = int(srow.get("inactiveBalance") or 0)
             staker_sum += balance
@@ -172,6 +175,25 @@ class Jobs:
             self.db.upsert_staker_snapshot(
                 self.cfg.validator_addr, address, now, balance, inactive
             )
+
+        # Tombstone departed stakers (2026-09-30 review): an address with a
+        # prior nonzero balance that vanished from the staker list has fully
+        # unstaked. Without a closing snapshot row its attribution blocks the
+        # cycle close forever (the 2026-09-18..09-30 wedge, nonzero variant).
+        # One zero-balance snapshot makes the vanish observable: Guard 2
+        # records it as an honest "unstaked during cycle" MISMATCH, and the
+        # departed-zero exclusion drops it from later windows.
+        # GUARD: an EMPTY payload must never tombstone the whole pool - a
+        # stakers-API outage or empty answer means "no data", not "everyone
+        # left". Absence is only meaningful when the endpoint answered with
+        # at least one row.
+        if present:
+            for row in self.db.latest_staker_rows(self.cfg.validator_addr):
+                addr = row["address"]
+                if addr not in present and int(row["balance_luna"] or 0) > 0:
+                    self.db.upsert_staker_snapshot(
+                        self.cfg.validator_addr, addr, now, 0, 0
+                    )
 
         # Deposit is not exposed by the API; derive it as total minus the sum
         # of staker records when both are present (100000 NIM when known).
@@ -214,37 +236,84 @@ class Jobs:
     # ------------------------------------------------------------------- job 3
 
     def run_cycle_close(self):
-        pending = self.db.latest_pending_cycle(self.cfg.validator_addr)
-        if pending is None:
+        # Close several batches per poll when a backlog exists (a wedged close
+        # left 15k batches after 12 days of stalls, 2026-09-18..09-30). Normal
+        # steady state closes the one available batch per pass, so this only
+        # changes catch-up speed, not verify semantics: every cycle still runs
+        # the full attribution + guard set.
+        cap = self.cfg.max_close_per_tick
+        rounds = cap if cap and cap > 0 else 1
+        for _ in range(rounds):
+            pending = self.db.latest_pending_cycle(self.cfg.validator_addr)
+            if pending is None:
+                break
+
+            # Close on the end of the first complete restake batch strictly
+            # after the cycle's opened_block. The restake bot sends a
+            # distribution as a burst of AddStake txs ~1-2 blocks apart;
+            # capturing the whole batch keeps the window aligned with the
+            # per-staker balance deltas.
+            boundary = self.db.next_restake_batch(
+                self.cfg.validator_addr, int(pending["opened_block"]),
+                self.cfg.batch_gap_blocks,
+            )
+            if boundary is None:
+                break
+
+            closed_block, batch = boundary
+            window = self.db.restakes_in_window(
+                self.cfg.validator_addr, int(pending["opened_block"]), closed_block
+            )
+            before = pending["id"]
+            self._verify_and_close(pending, closed_block, window,
+                                   boundary=batch)
+            row = self.db.get_cycle(before)
+            if row is None or row["status"] == "PENDING":
+                # No progress possible (e.g. a hard Guard-1 block): stop the
+                # catch-up loop for this tick instead of spinning on the
+                # same pending cycle.
+                break
+            self._last_closed_pending_id = before
+
+        if self.db.latest_pending_cycle(self.cfg.validator_addr) is None:
             self._open_pending_cycle()
-            return
-
-        # Close on the end of the first complete restake batch strictly after the
-        # cycle's opened_block. The restake bot sends a distribution as a burst
-        # of AddStake txs ~1-2 blocks apart; capturing the whole batch keeps the
-        # window aligned with the per-staker balance deltas.
-        boundary = self.db.next_restake_batch(
-            self.cfg.validator_addr, int(pending["opened_block"]),
-            self.cfg.batch_gap_blocks,
-        )
-        if boundary is None:
-            return
-
-        closed_block, batch = boundary
-        window = self.db.restakes_in_window(
-            self.cfg.validator_addr, int(pending["opened_block"]), closed_block
-        )
-        self._verify_and_close(pending, closed_block, window)
 
     def _open_pending_cycle(self):
-        opened_block = self.db.max_restake_block(self.cfg.validator_addr) or 0
-        total = self._latest_validator_total()
+        """Open the successor cycle window.
+
+        Chain from the LAST CLOSED cycle's closed_block whenever one exists:
+        in steady state that block is also the latest restake block (a cycle
+        closes on its batch end, so nothing newer exists yet), and after a
+        stall it keeps the entire backlog of already-ingested batches inside
+        their own windows instead of swallowing them into one giant PENDING
+        cycle (2026-09-18..09-30 incident).
+
+        opened_at_ms must be a chain-timestamp anchor, not the wall clock:
+        snapshot lookups run at-or-before/strictly-after opened_at_ms, and
+        for a historical window the relevant snapshots live in the past. The
+        first restake tx timestamp after the opener is that anchor; the wall
+        clock is only the fallback when no later tx is visible yet.
+        """
+        validator = self.cfg.validator_addr
+        latest = self.db.latest_closed_cycle_any(validator)
+        if latest is not None and latest["closed_block"] is not None:
+            opened_block = int(latest["closed_block"])
+            opened_at = (
+                self.db.first_restake_ts_after(validator, opened_block)
+                or self._now_ms()
+            )
+        else:
+            opened_block = self.db.max_restake_block(validator) or 0
+            opened_at = self._now_ms()
+        # The fallback denominator must reflect the window's own era: for a
+        # historical (catch-up) window, today's validator total is wrong.
+        era = self.db.validator_snapshot_at(validator, opened_at)
+        total = int(era["total_luna"]) if era is not None else self._latest_validator_total()
         self.db.create_cycle(
-            self.cfg.validator_addr, opened_block, self._now_ms(),
-            total, self.cfg.reserve_luna,
+            validator, opened_block, opened_at, total, self.cfg.reserve_luna,
         )
 
-    def _verify_and_close(self, pending, closed_block, window):
+    def _verify_and_close(self, pending, closed_block, window, boundary=None):
         opened_block = int(pending["opened_block"])
         rewards = self.db.rewards_in_window(
             self.cfg.validator_addr, opened_block, closed_block
@@ -287,24 +356,69 @@ class Jobs:
 
         total = int(pending["total_luna"]) or 1
         opened_at_ms = int(pending["opened_at_ms"])
-        boundary_hash = ""
-        boundary = self.db.next_restake_batch(
-            self.cfg.validator_addr, opened_block, self.cfg.batch_gap_blocks
+        # Re-anchor stale wall-clock openers (2026-09-30 review): a PENDING
+        # cycle that hard-blocked for days carries a wall-clock opened_at_ms
+        # older than its closing batch, so "first snapshot strictly after"
+        # would resolve to a pre-payout poll and mis-attribute the window.
+        # Anchoring at the first restake tx strictly after the opener block
+        # gives the identical chain-time semantics new cycles already get.
+        reanchored = self.db.first_restake_ts_after(
+            self.cfg.validator_addr, opened_block
         )
-        if boundary is not None:
-            boundary_hash = boundary[1][-1]["tx_hash"]
+        if reanchored is not None and reanchored > opened_at_ms:
+            opened_at_ms = reanchored
+        boundary_hash = ""
+        if boundary:
+            boundary_hash = boundary[-1]["tx_hash"]
+        else:
+            b = self.db.next_restake_batch(
+                self.cfg.validator_addr, opened_block, self.cfg.batch_gap_blocks
+            )
+            if b is not None:
+                boundary_hash = b[1][-1]["tx_hash"]
 
         # Option A attribution: active balances only change via AddStake, so a
         # staker's credit is the active-balance delta between the snapshot
         # at/before the window opened and the first snapshot strictly after.
+        # Balance lookups are memoized per (addr) per window: the exclusion
+        # scan, Guard 1, the delta loop, staker_sum and the expected loop all
+        # read the same two values, and at 3+ stakers x hundreds of closes per
+        # tick the redundant queries dominate drain latency.
+        open_bal_map = {}
+        close_bal_map = {}
         open_addrs = self.db.staker_addresses_at(self.cfg.validator_addr, opened_at_ms)
         close_addrs = self.db.staker_addresses_after(
             self.cfg.validator_addr, opened_at_ms
         )
 
-        # Guard 1: every staker present at open needs a snapshot strictly after
-        # the cycle opened; otherwise the window cannot be attributed.
-        for addr in open_addrs:
+        # A staker whose balance was already 0 at the cycle open and whose last
+        # snapshot IS that open (never snapshotted again afterwards) has fully
+        # unstaked and left the staker list: the snapshot job stops fetching
+        # them, so a "strictly after" snapshot can never exist. Blocking the
+        # close on them wedges every later cycle (12-day outage root cause,
+        # 2026-09-18..09-30). They hold no stake and expect no share; drop them
+        # from the attribution set instead. A staker with a NONZERO balance at
+        # open whose snapshots genuinely stopped still blocks the close: that
+        # is real insufficient data and must stay PENDING.
+        excluded = set()
+        for addr in sorted(open_addrs):
+            bal_at = self.db.staker_balance_at(
+                self.cfg.validator_addr, addr, opened_at_ms
+            )
+            bal_after = self.db.staker_balance_after(
+                self.cfg.validator_addr, addr, opened_at_ms
+            )
+            open_bal_map[addr] = bal_at
+            if bal_after is not None:
+                close_bal_map[addr] = bal_after
+            if bal_after is None and bal_at == 0:
+                excluded.add(addr)
+        open_addrs -= excluded
+
+        # Guard 1: every remaining staker present at open needs a snapshot
+        # strictly after the cycle opened; otherwise the window cannot be
+        # attributed.
+        for addr in sorted(open_addrs):
             if self.db.staker_balance_after(
                 self.cfg.validator_addr, addr, opened_at_ms
             ) is None:
@@ -314,13 +428,18 @@ class Jobs:
         unaccounted = 0
         reason_map = {}
         actual_map = {}
-        for addr in open_addrs:
-            open_bal = self.db.staker_balance_at(
-                self.cfg.validator_addr, addr, opened_at_ms
-            ) or 0
-            close_bal = self.db.staker_balance_after(
-                self.cfg.validator_addr, addr, opened_at_ms
-            )
+        for addr in sorted(open_addrs):
+            open_bal = open_bal_map.get(addr) or 0
+            close_bal = close_bal_map.get(addr)
+            if close_bal is None:
+                close_bal = self.db.staker_balance_after(
+                    self.cfg.validator_addr, addr, opened_at_ms
+                )
+                if close_bal is None:
+                    # Data vanished between Guard 1 and attribution; do not
+                    # guess a zero delta, leave the cycle PENDING.
+                    return
+                close_bal_map[addr] = close_bal
             delta = close_bal - open_bal
             actual_map[addr] = delta
             if delta < 0:
@@ -353,14 +472,12 @@ class Jobs:
         # redistributed to stakers; the verifier must expect that). Falls back
         # to the validator total when no staker snapshots exist.
         staker_sum = sum(
-            (self.db.staker_balance_at(self.cfg.validator_addr, a, opened_at_ms) or 0)
+            (open_bal_map.get(a) or 0)
             for a in open_addrs
         )
         denom = staker_sum if staker_sum > 0 else total
-        for addr in open_addrs:
-            balance = self.db.staker_balance_at(
-                self.cfg.validator_addr, addr, opened_at_ms
-            ) or 0
+        for addr in sorted(open_addrs):
+            balance = open_bal_map.get(addr) or 0
             expected = (balance * available) // denom
             expected_total += expected
             actual = actual_map[addr]
@@ -443,9 +560,13 @@ class Jobs:
 
     def run_verify(self):
         """Standalone verify (G2): recompute shares for the most recent cycle
-        that has a closing restake boundary available."""
+        that has a closing restake boundary available. Skipped when the close
+        job already handled the pending cycle this tick (drain rate 600 makes
+        a duplicated close attempt the common case, not the exception)."""
         pending = self.db.latest_pending_cycle(self.cfg.validator_addr)
         if pending is not None:
+            if pending["id"] == self._last_closed_pending_id:
+                return
             boundary = self.db.next_restake_batch(
                 self.cfg.validator_addr, int(pending["opened_block"]),
                 self.cfg.batch_gap_blocks,

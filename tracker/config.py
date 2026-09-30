@@ -30,6 +30,15 @@ BATCH_GAP_BLOCKS = 10
 # and is NOT deducted from the distributable amount.
 DUST_TOLERANCE_LUNA = 500
 
+# Upper bound on cycles closed per scheduler pass. A stalled or backlog state
+# (a Guard-1 block stopped closes for 12 days, 2026-09-18..09-30) leaves
+# thousands of already-ingested batches unverified; catch-up drains up to this
+# many batches per 60s poll, so a ~15k-batch backlog clears in ~25 minutes
+# instead of a day. Steady state unaffected: the loop breaks as soon as no
+# complete batch is available (2nd iteration). Each closed cycle still runs
+# the full attribution + guard set. 0 means "one close per tick" (no batching).
+MAX_CLOSE_PER_TICK = 600
+
 
 def _get_int(env, name, default):
     raw = env.get(name)
@@ -64,6 +73,9 @@ class Config:
             env, "DUST_TOLERANCE_LUNA", DUST_TOLERANCE_LUNA
         )
         self.batch_gap_blocks = _get_int(env, "BATCH_GAP_BLOCKS", BATCH_GAP_BLOCKS)
+        self.max_close_per_tick = _get_int(
+            env, "MAX_CLOSE_PER_TICK", MAX_CLOSE_PER_TICK
+        )
         self.data_dir = _get_str(env, "DATA_DIR", "/data")
         self.port = _get_int(env, "PORT", 8649)
         self.poll_seconds = _get_int(env, "POLL_SECONDS", 60)
