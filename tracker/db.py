@@ -95,6 +95,13 @@ CREATE TABLE IF NOT EXISTS epoch_stats (
   updated_at_ms INTEGER,
   PRIMARY KEY (validator, epoch)
 );
+
+-- Catch-up drain performance (2026-09-30 review): batch-finding and
+-- window scans on restake_txs plus validator-snapshot anchoring run once
+-- per closed cycle (up to max_close_per_tick per poll); unindexed they
+-- full-scan (~25 ms/scan measured at 167k rows vs 0.1 ms indexed).
+CREATE INDEX IF NOT EXISTS idx_rt_block ON restake_txs (validator, block);
+CREATE INDEX IF NOT EXISTS idx_vs_lookup ON validator_snapshots (validator, fetched_at_ms);
 """
 
 
@@ -210,6 +217,17 @@ class DB:
             "SELECT * FROM validator_snapshots WHERE validator=? "
             "ORDER BY fetched_at_ms DESC LIMIT 1",
             (validator,),
+        ).fetchone()
+        return row
+
+    def validator_snapshot_at(self, validator, at_or_before_ms):
+        """Latest validator snapshot at or before at_or_before_ms, or None.
+        Anchors historical cycles' fallback denominator to the window's own
+        era instead of today's total."""
+        row = self.conn.execute(
+            "SELECT * FROM validator_snapshots WHERE validator=? "
+            "AND fetched_at_ms<=? ORDER BY fetched_at_ms DESC LIMIT 1",
+            (validator, at_or_before_ms),
         ).fetchone()
         return row
 
@@ -342,6 +360,26 @@ class DB:
             (validator,),
         ).fetchone()
         return row
+
+    def latest_closed_cycle_any(self, validator):
+        """Most recent closed cycle of any status (VERIFIED, MISMATCH,
+        SKIPPED) - the anchor for chaining the successor cycle's window."""
+        row = self.conn.execute(
+            "SELECT * FROM cycles WHERE validator=? AND status IN "
+            "('VERIFIED','MISMATCH','SKIPPED') "
+            "ORDER BY id DESC LIMIT 1",
+            (validator,),
+        ).fetchone()
+        return row
+
+    def first_restake_ts_after(self, validator, block):
+        """Timestamp of the first restake tx strictly after block, or None."""
+        row = self.conn.execute(
+            "SELECT ts_ms FROM restake_txs WHERE validator=? AND block>? "
+            "AND ts_ms IS NOT NULL ORDER BY block ASC LIMIT 1",
+            (validator, block),
+        ).fetchone()
+        return int(row["ts_ms"]) if row else None
 
     def latest_closed_cycle(self, validator):
         row = self.conn.execute(
@@ -506,22 +544,39 @@ class DB:
         A batch is a run of restakes where consecutive blocks differ by at most
         gap_blocks; a larger gap (a new distribution event or a pause) starts a
         new batch. last_block is the block of the batch's final tx, which becomes
-        the cycle's closed_block."""
-        rows = self.conn.execute(
-            "SELECT * FROM restake_txs WHERE validator=? AND block>? "
-            "ORDER BY block ASC",
-            (validator, after_block),
-        ).fetchall()
-        if not rows:
-            return None
-        batch = [rows[0]]
-        last = int(rows[0]["block"])
-        for row in rows[1:]:
-            if int(row["block"]) - last > gap_blocks:
-                break
-            batch.append(row)
-            last = int(row["block"])
-        return last, batch
+        the cycle's closed_block.
+
+        Rows are fetched through an indexed block-range window (block range
+        grows by 2000 until a gap boundary or range end is proven) instead of
+        loading every restake row above the cursor: during a 15k-cycle drain
+        this query runs 2x per close, and an unbounded fetch scanned the
+        whole remaining table (~0.4 s per close) each time."""
+        LIMIT = 2000
+        start = int(after_block) + 1
+        while True:
+            rows = self.conn.execute(
+                "SELECT * FROM restake_txs WHERE validator=? AND block>=? "
+                "AND block<? ORDER BY block ASC LIMIT ?",
+                (validator, start, start + LIMIT, LIMIT),
+            ).fetchall()
+            if not rows:
+                return None
+            batch = [rows[0]]
+            last = int(rows[0]["block"])
+            boundary_proven = False
+            for row in rows[1:]:
+                if int(row["block"]) - last > gap_blocks:
+                    boundary_proven = True
+                    break
+                batch.append(row)
+                last = int(row["block"])
+            if boundary_proven:
+                return last, batch
+            if len(rows) < LIMIT or rows[-1]["block"] < start + LIMIT - 1:
+                return last, batch
+            # Window filled to its cap without a boundary: the batch may
+            # continue past the window edge; expand and retry.
+            start = int(rows[-1]["block"])
 
     def restakes_in_window(self, validator, start_block, end_block):
         """Restakes with start_block < block <= end_block (closing batch inclusive)."""

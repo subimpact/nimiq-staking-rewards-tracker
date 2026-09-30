@@ -10,6 +10,7 @@ STAKER_A = "NQ01 AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA"
 STAKER_B = "NQ02 BBBB BBBB BBBB BBBB BBBB BBBB BBBB BBBB"
 STAKER_C = "NQ03 CCCC CCCC CCCC CCCC CCCC CCCC CCCC CCCC"
 STAKER_D = "NQ04 DDDD DDDD DDDD DDDD DDDD DDDD DDDD DDDD"
+STAKER_Z = "NQ05 ZZZZ ZZZZ ZZZZ ZZZZ ZZZZ ZZZZ ZZZZ ZZZZ"
 VALIDATOR = "NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY"
 REWARD_ADDR = VALIDATOR
 
@@ -143,22 +144,22 @@ def coinbase_tx(block, value_luna, tx_hash, ts=None):
     }
 
 
-def restake_tx(block, to_addr, value_luna, tx_hash):
+def restake_tx(block, to_addr, value_luna, tx_hash, ts=None):
     return {
         "blockNumber": block,
         "sender": REWARD_ADDR,
         "recipient": to_addr,
         "value": value_luna,
-        "timestamp": block * 1000,
+        "timestamp": ts if ts is not None else block * 1000,
         "hash": tx_hash,
     }
 
 
-def staking_tx(block, value_luna, tx_hash, staker=None):
+def staking_tx(block, value_luna, tx_hash, staker=None, ts=None):
     """AddStake tx to the staking contract. When `staker` is given, the tx
     carries relatedAddresses naming the credited staker (mimics the explorer
     RPC), which is what the verifier uses for per-staker tx attribution."""
-    tx = restake_tx(block, STAKING_CONTRACT_ADDR, value_luna, tx_hash)
+    tx = restake_tx(block, STAKING_CONTRACT_ADDR, value_luna, tx_hash, ts=ts)
     if staker:
         tx["relatedAddresses"] = [REWARD_ADDR, STAKING_CONTRACT_ADDR, staker]
     return tx

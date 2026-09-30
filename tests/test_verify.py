@@ -630,15 +630,19 @@ class VerifyTest(unittest.TestCase):
             run_pass(jobs)
 
             cycles = closed_cycle(db)
-            self.assertEqual(len(cycles), 2)
-            # Newest first: the skipped slice, then the verified funding cycle.
-            skipped, funded = cycles[0], cycles[1]
+            # Catch-up close: the split burst's pieces each form their own
+            # sub-60-block window, and every window is explicitly closed
+            # (SKIPPED) instead of silently riding as the next cycle's opener.
+            self.assertEqual(len(cycles), 3)
+            # Newest first: two skipped slices, then the verified funding cycle.
+            skipped, skipped2, funded = cycles[0], cycles[1], cycles[2]
             self.assertEqual(skipped["status"], "SKIPPED")
-            # 113 -> 114: one block, a coinbase cannot fit inside.
+            # A coinbase cannot fit inside a sub-60-block slice.
             self.assertEqual(skipped["available_luna"], 0)
             self.assertLess(
                 skipped["closed_block"] - skipped["opened_block"], 60
             )
+            self.assertEqual(skipped2["status"], "SKIPPED")
             self.assertEqual(funded["status"], "VERIFIED")
             self.assertEqual(funded["available_luna"], AVAILABLE)
             self.assertEqual(funded["closed_block"], 102)
