@@ -338,8 +338,20 @@ class Jobs:
                 self.cfg.validator_addr, int(pending["opened_block"]), closed_block
             )
             before = pending["id"]
+            # Close-time bound for snapshot lookups (2026-10-06): the first
+            # restake tx timestamp after the closing batch. Without it the
+            # "strictly after" close-side lookups could reach into far later
+            # snapshots and a staker who joined DAYS after this historical
+            # window would fake an unattributable (Guard 3) credit here -
+            # every catch-up cycle in a joiner's pre-join era became a
+            # MISMATCH that way (2026-10-06 drain finding). The next batch's
+            # own tx timestamps are chain time, the same clock snapshots are
+            # polled against; beyond it, balances belong to the next window.
+            close_bound_ms = self.db.first_restake_ts_after(
+                self.cfg.validator_addr, closed_block
+            )
             self._verify_and_close(pending, closed_block, window,
-                                   boundary=batch)
+                                   boundary=batch, close_bound_ms=close_bound_ms)
             row = self.db.get_cycle(before)
             if row is None or row["status"] == "PENDING":
                 # No progress possible (e.g. a hard Guard-1 block): stop the
@@ -386,7 +398,8 @@ class Jobs:
             validator, opened_block, opened_at, total, self.cfg.reserve_luna,
         )
 
-    def _verify_and_close(self, pending, closed_block, window, boundary=None):
+    def _verify_and_close(self, pending, closed_block, window, boundary=None,
+                          close_bound_ms=None):
         opened_block = int(pending["opened_block"])
         rewards = self.db.rewards_in_window(
             self.cfg.validator_addr, opened_block, closed_block
@@ -461,7 +474,7 @@ class Jobs:
         close_bal_map = {}
         open_addrs = self.db.staker_addresses_at(self.cfg.validator_addr, opened_at_ms)
         close_addrs = self.db.staker_addresses_after(
-            self.cfg.validator_addr, opened_at_ms
+            self.cfg.validator_addr, opened_at_ms, close_bound_ms
         )
 
         # A staker whose balance was already 0 at the cycle open and whose last
@@ -479,7 +492,7 @@ class Jobs:
                 self.cfg.validator_addr, addr, opened_at_ms
             )
             bal_after = self.db.staker_balance_after(
-                self.cfg.validator_addr, addr, opened_at_ms
+                self.cfg.validator_addr, addr, opened_at_ms, close_bound_ms
             )
             open_bal_map[addr] = bal_at
             if bal_after is not None:
@@ -493,7 +506,7 @@ class Jobs:
         # attributed.
         for addr in sorted(open_addrs):
             if self.db.staker_balance_after(
-                self.cfg.validator_addr, addr, opened_at_ms
+                self.cfg.validator_addr, addr, opened_at_ms, close_bound_ms
             ) is None:
                 # Insufficient snapshots; leave the cycle PENDING.
                 return
@@ -506,7 +519,7 @@ class Jobs:
             close_bal = close_bal_map.get(addr)
             if close_bal is None:
                 close_bal = self.db.staker_balance_after(
-                    self.cfg.validator_addr, addr, opened_at_ms
+                    self.cfg.validator_addr, addr, opened_at_ms, close_bound_ms
                 )
                 if close_bal is None:
                     # Data vanished between Guard 1 and attribution; do not
@@ -524,7 +537,7 @@ class Jobs:
         # cannot be attributed; count their window credit as unaccounted.
         for addr in close_addrs - open_addrs:
             close_bal = self.db.staker_balance_after(
-                self.cfg.validator_addr, addr, opened_at_ms
+                self.cfg.validator_addr, addr, opened_at_ms, close_bound_ms
             )
             unaccounted += close_bal or 0
 
