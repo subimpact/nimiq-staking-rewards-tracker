@@ -263,14 +263,25 @@ class DB:
         ).fetchone()
         return int(row["balance_luna"]) if row else None
 
-    def staker_balance_after(self, validator, address, after_ms):
+    def staker_balance_after(self, validator, address, after_ms, before_ms=None):
         """First snapshot balance for (validator, address) strictly after
-        after_ms, or None."""
-        row = self.conn.execute(
-            "SELECT balance_luna FROM staker_snapshots WHERE validator=? AND address=? "
-            "AND fetched_at_ms > ? ORDER BY fetched_at_ms ASC LIMIT 1",
-            (validator, address, after_ms),
-        ).fetchone()
+        after_ms, or None. When before_ms is given, only snapshots in
+        (after_ms, before_ms] qualify - the window's own closing time, so a
+        staker who joined AFTER this window does not fake a close-side
+        balance with their later snapshots."""
+        if before_ms is None:
+            row = self.conn.execute(
+                "SELECT balance_luna FROM staker_snapshots WHERE validator=? AND address=? "
+                "AND fetched_at_ms > ? ORDER BY fetched_at_ms ASC LIMIT 1",
+                (validator, address, after_ms),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT balance_luna FROM staker_snapshots WHERE validator=? AND address=? "
+                "AND fetched_at_ms > ? AND fetched_at_ms <= ? "
+                "ORDER BY fetched_at_ms ASC LIMIT 1",
+                (validator, address, after_ms, before_ms),
+            ).fetchone()
         return int(row["balance_luna"]) if row else None
 
     def staker_addresses_at(self, validator, at_or_before_ms):
@@ -283,14 +294,22 @@ class DB:
         ).fetchall()
         return {r["address"] for r in rows}
 
-    def staker_addresses_after(self, validator, after_ms):
+    def staker_addresses_after(self, validator, after_ms, before_ms=None):
         """Set of staker addresses present (snapshotted) strictly after
-        after_ms."""
-        rows = self.conn.execute(
-            "SELECT DISTINCT address FROM staker_snapshots WHERE validator=? "
-            "AND fetched_at_ms > ?",
-            (validator, after_ms),
-        ).fetchall()
+        after_ms. When before_ms is given the window is bounded:
+        fetched_at_ms in (after_ms, before_ms]."""
+        if before_ms is None:
+            rows = self.conn.execute(
+                "SELECT DISTINCT address FROM staker_snapshots WHERE validator=? "
+                "AND fetched_at_ms > ?",
+                (validator, after_ms),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT DISTINCT address FROM staker_snapshots WHERE validator=? "
+                "AND fetched_at_ms > ? AND fetched_at_ms <= ?",
+                (validator, after_ms, before_ms),
+            ).fetchall()
         return {r["address"] for r in rows}
 
     def latest_staker_rows(self, validator):

@@ -581,6 +581,29 @@ class VerifyTest(unittest.TestCase):
         # verify in such a slice: close SKIPPED, clear shares, credit nothing.
         fake, db, cfg, jobs = base_env()
         try:
+            # Clock alignment for the bounded close-side lookups (2026-10-06):
+            # fixture tx timestamps ride the block*1000 scale, so the staged
+            # snapshots must interleave between them too (production's tx
+            # timestamps and snapshot wall ms ARE the same clock; the base
+            # counter starts at unix-epoch scale, far past these tx ts).
+            # Schedule: pass-1 snapshot, pass-1 cycle-open fallback anchor
+            # (both consumed in pass 1: snapshot first, then the opener),
+            # pass-2 snapshot after the burst (102) but before the split tx
+            # at 113, pass-3 after tx-114; a reservoir keeps later calls
+            # strictly increasing.
+            sched = [90_000, 95_000, 108_000, 118_000]
+            state = {"i": 0}
+
+            def scripted_ms():
+                if state["i"] < len(sched):
+                    v = sched[state["i"]]
+                    state["i"] += 1
+                    return v
+                v = sched[-1] + (state["i"] - len(sched) + 1) * 1000
+                state["i"] += 1
+                return v
+
+            jobs._now_ms = scripted_ms
             stage_open_close(
                 fake,
                 [
