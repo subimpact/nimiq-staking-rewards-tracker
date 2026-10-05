@@ -560,7 +560,24 @@ class DB:
                 (validator, start, start + LIMIT, LIMIT),
             ).fetchall()
             if not rows:
-                return None
+                # 2026-10-06 close-stall fix: an empty window used to return
+                # None, which run_cycle_close treats as "nothing to close"
+                # and stops FOREVER when the cursor sits in a restake-silent
+                # stretch longer than the window (the 12-day PENDING wedge at
+                # cycle 3321: opened 62078649, first stored restake 62121732,
+                # a 43k-block quiet stretch left by the old 200-tx ingest
+                # gap). A silent stretch is not "no more restakes" - hop the
+                # window forward and keep scanning (the indexed range scans
+                # stay cheap; the loop exits at real end-of-table).
+                nxt = self.conn.execute(
+                    "SELECT MIN(block) FROM restake_txs WHERE validator=? "
+                    "AND block>=?",
+                    (validator, start + LIMIT),
+                ).fetchone()
+                if nxt is None or nxt[0] is None:
+                    return None
+                start = max(int(nxt[0]), start + LIMIT)
+                continue
             batch = [rows[0]]
             last = int(rows[0]["block"])
             boundary_proven = False
