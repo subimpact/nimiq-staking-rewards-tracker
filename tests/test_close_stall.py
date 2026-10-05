@@ -43,7 +43,7 @@ class _F:
         self.cfg = cfg
         self.fake = fake
 
-    def get_transactions(self, address):
+    def get_transactions(self, address, stop_before_block=None):
         return self.fake.txs(address)
 
     def get_stakers(self):

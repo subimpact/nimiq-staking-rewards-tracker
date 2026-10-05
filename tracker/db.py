@@ -605,6 +605,19 @@ class DB:
         ).fetchone()
         return int(row["m"]) if row and row["m"] is not None else 0
 
+    def oldest_reward_or_restake_block(self, validator):
+        """Oldest block across rewards + restake_txs: the walk-back floor for
+        a cold-start ingest (everything at-or-after it is already stored)."""
+        row = self.conn.execute(
+            "SELECT MIN(b) AS m FROM ("
+            "  SELECT MIN(block) AS b FROM rewards WHERE validator=?"
+            "  UNION ALL"
+            "  SELECT MIN(block) FROM restake_txs WHERE validator=?"
+            ")",
+            (validator, validator),
+        ).fetchone()
+        return int(row["m"]) if row and row["m"] is not None else None
+
     # ---- epoch stats ----
 
     def upsert_epoch_stats(self, validator, epoch, start_block, end_block,
