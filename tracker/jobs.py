@@ -18,17 +18,20 @@ Cycle model (deterministic, integer-only):
 
 import json
 import time
+import urllib.error
 import urllib.request
 
 from tracker.config import COINBASE_ADDR, STAKING_CONTRACT_ADDR
 
 MAX_TX_BATCH = 200
-# Upper bound on pages walked back per ingest. With ~40-70 blocks per page
-# (restakes cluster several txs per block) and the watermark stopping the walk,
-# this exists so a corrupted watermark can never turn one poll into an
-# unbounded crawl; 50 pages x 200 txs ≈ 3k+ blocks of backfill per poll, far
-# beyond any outage the 60s scheduler can produce.
-MAX_TX_PAGES = 50
+# Upper bound on pages walked back per ingest. Steady state needs ~1 page:
+# the reward address sees ~1700 txs/epoch (~2.4 txs/min), so page 1 alone
+# re-covers ~80+ minutes; the watermark normally stops page 2. 50 would fire
+# up to 50 RPC calls per poll and rate-limit (HTTP 429) on the shared public
+# explorer - the outage this fix exists to survive is a *tracker* outage
+# (deploy/egress), and even a multi-day one is covered at 3 pages x 200 txs
+# per minute-scheduled poll: catch-up drains progressively poll by poll.
+MAX_TX_PAGES = 3
 # Watermark meta keys: ingest walks back to the previous watermark so a poll
 # outage (deploy, egress outage, RPC downtime) longer than one page of txs
 # can no longer skip blocks permanently.
@@ -87,9 +90,17 @@ class LiveFetcher:
         txs = []
         cursor = None
         for _page in range(MAX_TX_PAGES):
-            res = self._rpc(
-                "getTransactionsByAddress", [address, MAX_TX_BATCH, cursor]
-            )
+            try:
+                res = self._rpc(
+                    "getTransactionsByAddress", [address, MAX_TX_BATCH, cursor]
+                )
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429:
+                    # Shared public explorer rate-limited us mid-walk: keep
+                    # what previous pages gathered and let the next poll's
+                    # watermark continue the catch-up (progressive drain).
+                    break
+                raise
             if isinstance(res, dict):
                 data = res.get("data") or []
             else:
