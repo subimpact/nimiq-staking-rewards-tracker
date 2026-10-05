@@ -102,6 +102,12 @@ CREATE TABLE IF NOT EXISTS epoch_stats (
 -- full-scan (~25 ms/scan measured at 167k rows vs 0.1 ms indexed).
 CREATE INDEX IF NOT EXISTS idx_rt_block ON restake_txs (validator, block);
 CREATE INDEX IF NOT EXISTS idx_vs_lookup ON validator_snapshots (validator, fetched_at_ms);
+-- Bounded-attribution drain (2026-10-06): the balance/address lookups run
+-- per (staker x window) on staker_snapshots (~150k+ rows live) and the
+-- walk-back ingest + bounded window scans hit rewards by (validator, block).
+CREATE INDEX IF NOT EXISTS idx_ss_v_addr_ts ON staker_snapshots (validator, address, fetched_at_ms);
+CREATE INDEX IF NOT EXISTS idx_ss_v_ts ON staker_snapshots (validator, fetched_at_ms);
+CREATE INDEX IF NOT EXISTS idx_rw_v_block ON rewards (validator, block);
 """
 
 
