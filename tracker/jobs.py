@@ -23,6 +23,16 @@ import urllib.request
 from tracker.config import COINBASE_ADDR, STAKING_CONTRACT_ADDR
 
 MAX_TX_BATCH = 200
+# Upper bound on pages walked back per ingest. With ~40-70 blocks per page
+# (restakes cluster several txs per block) and the watermark stopping the walk,
+# this exists so a corrupted watermark can never turn one poll into an
+# unbounded crawl; 50 pages x 200 txs ≈ 3k+ blocks of backfill per poll, far
+# beyond any outage the 60s scheduler can produce.
+MAX_TX_PAGES = 50
+# Watermark meta keys: ingest walks back to the previous watermark so a poll
+# outage (deploy, egress outage, RPC downtime) longer than one page of txs
+# can no longer skip blocks permanently.
+META_INGEST_WATERMARK = "ingest_watermark_block"
 
 
 class LiveFetcher:
@@ -62,11 +72,40 @@ class LiveFetcher:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def get_transactions(self, address):
-        res = self._rpc("getTransactionsByAddress", [address, MAX_TX_BATCH, None])
-        if isinstance(res, dict):
-            return res.get("data") or []
-        return res or []
+    def get_transactions(self, address, stop_before_block=None):
+        """Fetch the validator/reward address's txs, newest first, following
+        the explorer's hash cursor to older pages.
+
+        The single-page read (newest MAX_TX_BATCH txs) covers only a few
+        minutes of chain: restakes land in bursts of several txs per block,
+        so a poll outage longer than ~14 minutes permanently skipped blocks
+        (the 1/720 attributed epochs). Pages walk BACK in time until a tx
+        older than stop_before_block is seen (everything at-or-after that
+        block is already in the DB) or the chain history ends. The caller's
+        upserts are idempotent (INSERT OR REPLACE), so overlap is free.
+        """
+        txs = []
+        cursor = None
+        for _page in range(MAX_TX_PAGES):
+            res = self._rpc(
+                "getTransactionsByAddress", [address, MAX_TX_BATCH, cursor]
+            )
+            if isinstance(res, dict):
+                data = res.get("data") or []
+            else:
+                data = res or []
+            if not data:
+                break
+            txs.extend(data)
+            oldest_block = min(_tx_block(t) for t in data)
+            if stop_before_block is not None and oldest_block < stop_before_block:
+                break
+            if len(data) < MAX_TX_BATCH:
+                break
+            cursor = _tx_hash(data[-1])
+            if not cursor:
+                break
+        return txs
 
     def get_stakers(self):
         return self._get(self.cfg.stakers_url())
@@ -87,19 +126,15 @@ def _tx_recipient(tx):
     return tx.get("recipient") or tx.get("to") or tx.get("toAddress") or ""
 
 
+def _tx_hash(tx):
+    return tx.get("hash") or ""
+
+
 def _tx_value(tx):
     raw = tx.get("value")
     if raw is None:
         raw = tx.get("amount", 0)
     return int(raw)
-
-
-def _tx_ts(tx):
-    return int(tx.get("timestamp", time.time() * 1000))
-
-
-def _tx_hash(tx):
-    return tx.get("hash") or ""
 
 
 def _tx_related(tx):
@@ -109,6 +144,10 @@ def _tx_related(tx):
     Absent or empty means the endpoint did not expose the mapping (fail-open:
     the verifier falls back to balance-delta math and the boundary hash)."""
     return tx.get("relatedAddresses") or tx.get("related") or []
+
+
+def _tx_ts(tx):
+    return int(tx.get("timestamp", time.time() * 1000))
 
 
 def _staker_from_related(tx, validator_addr, contract_addr):
@@ -207,7 +246,23 @@ class Jobs:
     # ------------------------------------------------------------------- job 2
 
     def run_ingest(self):
-        txs = self.fetcher.get_transactions(self.cfg.reward_addr)
+        # Walk back to the previous ingest watermark (the oldest block the
+        # last successful poll already covered). First ingest after a cold
+        # start with no watermark falls back to the oldest already-ingested
+        # tx block, and only when both are unknown does it read a single
+        # newest page (the pre-fix behavior; the next successful poll plants
+        # the watermark and the catch-up window opens from then on).
+        validator = self.cfg.validator_addr
+        wm_raw = self.db.get_meta(META_INGEST_WATERMARK)
+        if wm_raw is not None and str(wm_raw).strip().isdigit():
+            stop_before = int(wm_raw)
+        else:
+            oldest = self.db.oldest_reward_or_restake_block(validator)
+            stop_before = oldest if oldest else None
+        txs = self.fetcher.get_transactions(
+            self.cfg.reward_addr, stop_before_block=stop_before
+        )
+        watermark = stop_before if stop_before is not None else None
         for tx in txs or []:
             block = _tx_block(tx)
             sender = _tx_sender(tx).strip()
@@ -218,20 +273,27 @@ class Jobs:
 
             # Inbound coinbase block reward -> rewards row.
             if _is_coinbase(sender) and recipient == self.cfg.reward_addr:
-                self.db.upsert_reward(
-                    self.cfg.validator_addr, block, value, ts, tx_hash
-                )
+                self.db.upsert_reward(validator, block, value, ts, tx_hash)
                 continue
 
             # Outbound from the reward address -> restake.
             if sender == self.cfg.reward_addr and recipient:
-                staker = _staker_from_related(tx, self.cfg.validator_addr, STAKING_CONTRACT_ADDR)
+                staker = _staker_from_related(tx, validator, STAKING_CONTRACT_ADDR)
                 self.db.upsert_restake(
-                    self.cfg.validator_addr, block, recipient, value, ts, tx_hash, staker
+                    validator, block, recipient, value, ts, tx_hash, staker
                 )
                 continue
 
             # Anything else is the sentinel domain of the bot; ignore.
+
+        # Advance the watermark to the NEWEST tx block seen: the next poll's
+        # walk-back starts just before what this poll definitively covered.
+        # Only advance when txs were actually seen (an empty poll on a
+        # just-started chain must not pin the watermark at None).
+        if txs:
+            watermark = max(_tx_block(t) for t in txs)
+            if stop_before is None or watermark >= stop_before:
+                self.db.set_meta(META_INGEST_WATERMARK, str(watermark))
 
     # ------------------------------------------------------------------- job 3
 
