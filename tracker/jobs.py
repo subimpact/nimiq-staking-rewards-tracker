@@ -719,7 +719,12 @@ class Jobs:
 
         # Surface the drift/skim reasons on shares that have none yet.
         if drift or skim:
-            if drift:
+            if drift and skim:
+                reason = (
+                    "unaccounted restake value (possible timing drift); "
+                    "distribution does not match cycle rewards (possible skim)"
+                )
+            elif drift:
                 reason = "unaccounted restake value (possible timing drift)"
             else:
                 reason = "distribution does not match cycle rewards (possible skim)"
