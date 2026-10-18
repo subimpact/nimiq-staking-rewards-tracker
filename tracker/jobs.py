@@ -197,7 +197,6 @@ class Jobs:
     def __init__(self, db, cfg, fetcher=None, now_ms=None):
         self.db = db
         self.cfg = cfg
-        self._last_closed_pending_id = None
         self.fetcher = fetcher if fetcher is not None else LiveFetcher(cfg)
         # Monotonic clock injection: tests pass a counter so consecutive
         # snapshots never share a millisecond (same-ms timestamps made the
@@ -463,7 +462,6 @@ class Jobs:
                 # catch-up loop for this tick instead of spinning on the
                 # same pending cycle.
                 break
-            self._last_closed_pending_id = before
 
         if self.db.latest_pending_cycle(self.cfg.validator_addr) is None:
             self._open_pending_cycle()
@@ -755,31 +753,12 @@ class Jobs:
     # ------------------------------------------------------------------- job 4
 
     def run_verify(self):
-        """Standalone verify (G2): recompute shares for the most recent cycle
-        that has a closing restake boundary available. Skipped when the close
-        job already handled the pending cycle this tick (drain rate 600 makes
-        a duplicated close attempt the common case, not the exception)."""
-        pending = self.db.latest_pending_cycle(self.cfg.validator_addr)
-        if pending is not None:
-            if pending["id"] == self._last_closed_pending_id:
-                return
-            boundary = self.db.next_restake_batch(
-                self.cfg.validator_addr, int(pending["opened_block"]),
-                self.cfg.batch_gap_blocks,
-            )
-            if boundary is None:
-                # Window not closed yet; nothing to verify.
-                return
-            closed_block, _ = boundary
-            window = self.db.restakes_in_window(
-                self.cfg.validator_addr, int(pending["opened_block"]),
-                closed_block,
-            )
-            self._verify_and_close(pending, closed_block, window)
-            return
+        """Standalone verify (G2): idempotent re-credit of the latest closed
+        cycle's ok shares so /verify always has fresh data.
 
-        # No pending cycle: re-emit the latest closed cycle's shares (idempotent
-        # via the G1 ledger upsert) so /verify always has fresh data.
+        run_cycle_close is the only closer; run_verify must never close or
+        modify a PENDING cycle.
+        """
         latest = self.db.latest_closed_cycle(self.cfg.validator_addr)
         if latest is not None:
             shares = self.db.cycle_shares(latest["id"])
