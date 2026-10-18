@@ -39,6 +39,9 @@ DUST_TOLERANCE_LUNA = 500
 # the full attribution + guard set. 0 means "one close per tick" (no batching).
 MAX_CLOSE_PER_TICK = 600
 
+# Upper bound on pages walked per poll when draining pending ingest gaps.
+BACKFILL_PAGES_PER_POLL = 3
+
 
 def _get_int(env, name, default):
     raw = env.get(name)
@@ -75,6 +78,9 @@ class Config:
         self.batch_gap_blocks = _get_int(env, "BATCH_GAP_BLOCKS", BATCH_GAP_BLOCKS)
         self.max_close_per_tick = _get_int(
             env, "MAX_CLOSE_PER_TICK", MAX_CLOSE_PER_TICK
+        )
+        self.backfill_pages_per_poll = _get_int(
+            env, "BACKFILL_PAGES_PER_POLL", BACKFILL_PAGES_PER_POLL
         )
         self.data_dir = _get_str(env, "DATA_DIR", "/data")
         self.port = _get_int(env, "PORT", 8649)

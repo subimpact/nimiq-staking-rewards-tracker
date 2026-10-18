@@ -21,7 +21,11 @@ import time
 import urllib.error
 import urllib.request
 
-from tracker.config import COINBASE_ADDR, STAKING_CONTRACT_ADDR
+from tracker.config import (
+    BACKFILL_PAGES_PER_POLL,
+    COINBASE_ADDR,
+    STAKING_CONTRACT_ADDR,
+)
 
 MAX_TX_BATCH = 200
 # Upper bound on pages walked back per ingest. Steady state needs ~1 page:
@@ -36,6 +40,7 @@ MAX_TX_PAGES = 3
 # outage (deploy, egress outage, RPC downtime) longer than one page of txs
 # can no longer skip blocks permanently.
 META_INGEST_WATERMARK = "ingest_watermark_block"
+META_INGEST_GAPS = "ingest_gaps"
 
 
 class LiveFetcher:
@@ -77,28 +82,35 @@ class LiveFetcher:
 
     def get_transactions(self, address, stop_before_block=None):
         """Fetch the validator/reward address's txs, newest first, following
-        the explorer's hash cursor to older pages.
+        the explorer's hash cursor to older pages. Kept for backward compatibility.
+        """
+        txs, _status, _last_hash = self.walk_transactions(
+            address, stop_before_block=stop_before_block
+        )
+        return txs
 
-        The single-page read (newest MAX_TX_BATCH txs) covers only a few
-        minutes of chain: restakes land in bursts of several txs per block,
-        so a poll outage longer than ~14 minutes permanently skipped blocks
-        (the 1/720 attributed epochs). Pages walk BACK in time until a tx
-        older than stop_before_block is seen (everything at-or-after that
-        block is already in the DB) or the chain history ends. The caller's
-        upserts are idempotent (INSERT OR REPLACE), so overlap is free.
+    def walk_transactions(
+        self, address, stop_before_block=None, start_cursor=None, max_pages=MAX_TX_PAGES
+    ):
+        """Fetch transactions newest first, walking older pages using hash cursor.
+
+        Returns (txs, status, last_hash) where status is one of:
+          - "reached_floor": oldest tx < stop_before_block
+          - "end_of_history": short page (< MAX_TX_BATCH) or empty data
+          - "truncated": hit max_pages cap or HTTP 429
         """
         txs = []
-        cursor = None
-        for _page in range(MAX_TX_PAGES):
+        cursor = start_cursor
+        last_hash = start_cursor
+        status = "truncated" if max_pages <= 0 else "end_of_history"
+        for _page in range(max_pages):
             try:
                 res = self._rpc(
                     "getTransactionsByAddress", [address, MAX_TX_BATCH, cursor]
                 )
             except urllib.error.HTTPError as exc:
                 if exc.code == 429:
-                    # Shared public explorer rate-limited us mid-walk: keep
-                    # what previous pages gathered and let the next poll's
-                    # watermark continue the catch-up (progressive drain).
+                    status = "truncated"
                     break
                 raise
             if isinstance(res, dict):
@@ -106,17 +118,24 @@ class LiveFetcher:
             else:
                 data = res or []
             if not data:
+                status = "end_of_history"
                 break
             txs.extend(data)
+            last_hash = _tx_hash(data[-1])
             oldest_block = min(_tx_block(t) for t in data)
             if stop_before_block is not None and oldest_block < stop_before_block:
+                status = "reached_floor"
                 break
             if len(data) < MAX_TX_BATCH:
+                status = "end_of_history"
                 break
-            cursor = _tx_hash(data[-1])
+            cursor = last_hash
             if not cursor:
+                status = "end_of_history"
                 break
-        return txs
+        else:
+            status = "truncated"
+        return txs, status, last_hash
 
     def get_stakers(self):
         return self._get(self.cfg.stakers_url())
@@ -256,6 +275,49 @@ class Jobs:
 
     # ------------------------------------------------------------------- job 2
 
+    def _store_tx(self, tx):
+        validator = self.cfg.validator_addr
+        block = _tx_block(tx)
+        sender = _tx_sender(tx).strip()
+        recipient = _tx_recipient(tx).strip()
+        value = _tx_value(tx)
+        ts = _tx_ts(tx)
+        tx_hash = _tx_hash(tx)
+
+        # Inbound coinbase block reward -> rewards row.
+        if _is_coinbase(sender) and recipient == self.cfg.reward_addr:
+            self.db.upsert_reward(validator, block, value, ts, tx_hash)
+            return
+
+        # Outbound from the reward address -> restake.
+        if sender == self.cfg.reward_addr and recipient:
+            staker = _staker_from_related(tx, validator, STAKING_CONTRACT_ADDR)
+            self.db.upsert_restake(
+                validator, block, recipient, value, ts, tx_hash, staker
+            )
+            return
+
+    def _load_gaps(self):
+        raw = self.db.get_meta(META_INGEST_GAPS)
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_gaps(self, gaps):
+        self.db.set_meta(META_INGEST_GAPS, json.dumps(gaps))
+
+    def _record_gap(self, cursor, floor):
+        if not cursor or floor is None:
+            return
+        gaps = self._load_gaps()
+        gaps = [g for g in gaps if g.get("floor") != floor]
+        gaps.insert(0, {"cursor": cursor, "floor": floor})
+        self._save_gaps(gaps)
+
     def run_ingest(self):
         # Walk back to the previous ingest watermark (the oldest block the
         # last successful poll already covered). First ingest after a cold
@@ -270,32 +332,30 @@ class Jobs:
         else:
             oldest = self.db.oldest_reward_or_restake_block(validator)
             stop_before = oldest if oldest else None
-        txs = self.fetcher.get_transactions(
-            self.cfg.reward_addr, stop_before_block=stop_before
-        )
-        watermark = stop_before if stop_before is not None else None
+
+        is_cold_start = (stop_before is None)
+        head_max_pages = 1 if is_cold_start else MAX_TX_PAGES
+
+        if hasattr(self.fetcher, "walk_transactions"):
+            txs, status, last_hash = self.fetcher.walk_transactions(
+                self.cfg.reward_addr,
+                stop_before_block=stop_before,
+                start_cursor=None,
+                max_pages=head_max_pages,
+            )
+        else:
+            txs = self.fetcher.get_transactions(
+                self.cfg.reward_addr, stop_before_block=stop_before
+            )
+            oldest = min((_tx_block(t) for t in txs), default=None)
+            if stop_before is not None and oldest is not None and oldest < stop_before:
+                status = "reached_floor"
+            else:
+                status = "end_of_history"
+            last_hash = _tx_hash(txs[-1]) if txs else None
+
         for tx in txs or []:
-            block = _tx_block(tx)
-            sender = _tx_sender(tx).strip()
-            recipient = _tx_recipient(tx).strip()
-            value = _tx_value(tx)
-            ts = _tx_ts(tx)
-            tx_hash = _tx_hash(tx)
-
-            # Inbound coinbase block reward -> rewards row.
-            if _is_coinbase(sender) and recipient == self.cfg.reward_addr:
-                self.db.upsert_reward(validator, block, value, ts, tx_hash)
-                continue
-
-            # Outbound from the reward address -> restake.
-            if sender == self.cfg.reward_addr and recipient:
-                staker = _staker_from_related(tx, validator, STAKING_CONTRACT_ADDR)
-                self.db.upsert_restake(
-                    validator, block, recipient, value, ts, tx_hash, staker
-                )
-                continue
-
-            # Anything else is the sentinel domain of the bot; ignore.
+            self._store_tx(tx)
 
         # Advance the watermark to the NEWEST tx block seen: the next poll's
         # walk-back starts just before what this poll definitively covered.
@@ -305,6 +365,43 @@ class Jobs:
             watermark = max(_tx_block(t) for t in txs)
             if stop_before is None or watermark >= stop_before:
                 self.db.set_meta(META_INGEST_WATERMARK, str(watermark))
+
+        # Truncation during head walk records a pending gap (cold start must NOT register a gap)
+        if not is_cold_start and status == "truncated" and last_hash:
+            self._record_gap(cursor=last_hash, floor=stop_before)
+
+        # Drain gaps newest-first up to BACKFILL_PAGES_PER_POLL
+        if hasattr(self.fetcher, "walk_transactions"):
+            backfill_cap = getattr(self.cfg, "backfill_pages_per_poll", BACKFILL_PAGES_PER_POLL)
+            remaining_pages = backfill_cap
+            gaps = self._load_gaps()
+            while remaining_pages > 0 and gaps:
+                gap = gaps[0]
+                cursor = gap.get("cursor")
+                floor = gap.get("floor")
+                gap_txs, gap_status, gap_last_hash = self.fetcher.walk_transactions(
+                    self.cfg.reward_addr,
+                    stop_before_block=floor,
+                    start_cursor=cursor,
+                    max_pages=remaining_pages,
+                )
+                for tx in gap_txs or []:
+                    self._store_tx(tx)
+
+                pages_used = max(1, (len(gap_txs) + MAX_TX_BATCH - 1) // MAX_TX_BATCH) if gap_txs else 1
+                remaining_pages -= pages_used
+
+                if gap_status in ("reached_floor", "end_of_history"):
+                    gaps.pop(0)
+                    self._save_gaps(gaps)
+                elif gap_status == "truncated":
+                    if gap_last_hash:
+                        gap["cursor"] = gap_last_hash
+                    self._save_gaps(gaps)
+                    break
+                else:
+                    break
+
 
     # ------------------------------------------------------------------- job 3
 
