@@ -8,12 +8,14 @@ Cycle model (deterministic, integer-only):
   - The window of a cycle is [opened_block, closed_block): a cycle is closed
     when a new restake transaction appears at a block strictly greater than the
     cycle's opened_block.
-  - available_luna = sum(rewards in window) - held_luna. reserve_luna is a
-    wallet safety floor (keep ~1 NIM for fees/rounding), NOT a per-cycle
-    deduction from the distributable amount; it is recorded for reference only.
+  - available_luna = sum(rewards in window) - held_luna. reserve_luna (the
+    bot's wallet floor, 0 today) is NOT a per-cycle deduction from the
+    distributable amount; it is recorded for reference only.
   - total_luna = the validator's latest snapshot at window open.
   - expected_i = floor(balance_i * available_luna / total_luna).
-  - actual_i = sum of per-staker restakes inside the window.
+  - actual_i = sum of the window's AddStake txs naming staker i in
+    relatedAddresses ("tx" attribution); the active-balance delta across the
+    window only when some tx lacks that mapping ("delta" attribution).
 """
 
 import json
@@ -28,13 +30,12 @@ from tracker.config import (
 )
 
 MAX_TX_BATCH = 200
-# Upper bound on pages walked back per ingest. Steady state needs ~1 page:
-# the reward address sees ~1700 txs/epoch (~2.4 txs/min), so page 1 alone
-# re-covers ~80+ minutes; the watermark normally stops page 2. 50 would fire
-# up to 50 RPC calls per poll and rate-limit (HTTP 429) on the shared public
-# explorer - the outage this fix exists to survive is a *tracker* outage
-# (deploy/egress), and even a multi-day one is covered at 3 pages x 200 txs
-# per minute-scheduled poll: catch-up drains progressively poll by poll.
+# Upper bound on pages walked back per ingest head walk. At ~18.6 txs/min
+# (19 stakers, measured 2026-10-18) one page covers ~11 minutes, so steady
+# state needs one page; anything the head walk cannot reach is recorded in
+# meta ingest_gaps and drained by the backfill pass (no outage loses data).
+# Keep it small: dozens of calls per poll rate-limit (HTTP 429) on the shared
+# public explorer.
 MAX_TX_PAGES = 3
 # Watermark meta keys: ingest walks back to the previous watermark so a poll
 # outage (deploy, egress outage, RPC downtime) longer than one page of txs

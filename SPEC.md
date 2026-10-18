@@ -1,30 +1,29 @@
-# nimiq-staking-rewards-tracker — Build Spec
+# nimiq-staking-rewards-tracker: Spec
 
-**Status:** v1.0 spec (2026-09-17). Owner: subimpact. Build lane: ocode (opencode, ollama-cloud/deepseek-v4-flash:0731).
+**Status:** v1.1 (2026-10-19). Owner: subimpact. Supersedes the v1.0 build spec of 2026-09-17. The verification math is documented in full in [README.md](README.md) ("G2: the verification math"); this file holds the architecture, schema and API contract.
 
 **Mission (two community-verified gaps):**
-- **G1 (issues #3170):** standard staking-rewards tracking web interface validators can deploy on their node. Per-staker rewards ledger: stake, share, every credited reward with tx hash, compounding history, projected yield.
-- **G2 (issues #3171):** validator reward transparency / integrity verification. For every distribution cycle, recompute each staker's expected share from chain state and compare against the actual on-chain restake transactions. Emit VERIFIED or MISMATCH with the math visible.
+- **G1 (issue #3170):** a staking-rewards tracker validators can deploy. Per-staker rewards ledger: stake, share, every credited reward with its own tx hash, compounding history.
+- **G2 (issue #3171):** reward distribution integrity. For every payout cycle, recompute each staker's expected share from chain data and compare it with the actual on-chain AddStake transactions. Emit VERIFIED, MISMATCH or SKIPPED with the per-staker math stored.
 
-Reference deployment: ImpactZero (NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY), feeds nimiq.subimpact.net `/staking` (G1, sign-in gated via existing Nimiq Pay/Hub flow) and `/verify` (G2, public).
+Reference deployment: ImpactZero (NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY), feeding nimiq.subimpact.net `/staking` (G1) and `/verify` (G2, public).
 
 ## Architecture
 
-- Single container, **no external Python dependencies** (stdlib only: `sqlite3`, `http.server`, `urllib.request`, `json`, `threading`, `argparse`, `time`, `signal`).
-- Language: **Python 3.11+**. Base image `python:3.11-slim`.
-- Entry: `tracker/main.py` → starts a read-only HTTP API thread (`http.server`) bound `0.0.0.0:8649` (container) + a scheduler loop every 60s running the four jobs (below). `SIGTERM` graceful shutdown.
-- Data: SQLite at `DATA_DIR/tracker.db` (default `/data`), WAL mode. Idempotent upserts, dedup by tx hash and block number.
-- **Data sources (all public/read-only, zero production-node changes):**
-  - `RPC_URL` (default `https://rpc.nimiqwatch.com`) — `getTransactionsByAddress` on the reward address for coinbases + restake txs (JSON-RPC POST, params `[address, 200, null]`).
-  - `STAKERS_URL_TEMPLATE` (default `https://nimiq-api.subimpact.net/api/stakers/{address}`) — latest staker records (`{data: [{address, balance, delegation, inactiveBalance, ...}]}`). Configurable so other validators can point at their own API.
-  - `VALIDATORS_URL_TEMPLATE` (default `https://nimiq-api.subimpact.net/api/validators`) — validator record for total stake + staker count.
-  - Optional `LOG_FILE` (e.g. host-mounted `/logs/restake.log`, read-only) for cycle boundary markers from the operator's restake bot; purely informational — verification data comes from the chain.
-- Config via env vars (see README section below); all thresholds mirror the ImpactZero restake bot: `MIN_TRIGGER_LUNA=2000`, `MIN_SHARE_LUNA=500`, `RESERVE_LUNA=100000` (wallet floor, informational only), `DUST_TOLERANCE_LUNA=500`, `REWARD_ADDR`, `VALIDATOR_ADDR`.
+- Single container, no external Python dependencies (stdlib only). Python 3.11+, base image `python:3.11-slim`, non-root user.
+- `tracker/main.py` starts a read-only HTTP API thread on `0.0.0.0:8649` inside the container (compose publishes it on `127.0.0.1:8649` only) and a scheduler that runs four jobs every `POLL_SECONDS` (60). Each job runs in its own error boundary; per-job status is exposed in `/api/health`. `SIGTERM` shuts down gracefully.
+- Data: SQLite at `DATA_DIR/tracker.db`, WAL mode, idempotent upserts.
+- Data sources (public, read-only; the tracker never touches a validator node or its keys):
+  - `RPC_URL` (default `https://rpc.nimiqwatch.com`): `getTransactionsByAddress` on the reward address, params `[address, 200, cursor_hash]`, newest first.
+  - `STAKERS_URL_TEMPLATE`: staker records (`{data: [{address, balance, inactiveBalance, ...}]}`).
+  - `VALIDATORS_URL_TEMPLATE`: validator list; the row whose address matches `VALIDATOR_ADDR` is used, and no validator snapshot is written if it is absent.
+- Thresholds mirror the ImpactZero restake bot: `MIN_SHARE_LUNA=500`, `DUST_TOLERANCE_LUNA=500`, `RESERVE_LUNA=0` (informational, never deducted), `BATCH_GAP_BLOCKS=10`.
 
 ## SQLite schema
 
 ```sql
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
+  -- keys: ingest_watermark_block, ingest_gaps (JSON list of {cursor, floor})
 CREATE TABLE validator_snapshots (
   validator TEXT, fetched_at_ms INTEGER, total_luna INTEGER, num_stakers INTEGER, deposit_luna INTEGER
 );
@@ -36,75 +35,74 @@ CREATE TABLE rewards (
   validator TEXT, block INTEGER, amount_luna INTEGER, ts_ms INTEGER, tx_hash TEXT,
   PRIMARY KEY (validator, block)
 );
+CREATE TABLE restake_txs (
+  validator TEXT, block INTEGER, to_addr TEXT, amount_luna INTEGER, ts_ms INTEGER, tx_hash TEXT,
+  staker_address TEXT NOT NULL DEFAULT '',   -- credited staker, from relatedAddresses
+  PRIMARY KEY (validator, block, to_addr, tx_hash)
+);
 CREATE TABLE cycles (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   validator TEXT, opened_block INTEGER, closed_block INTEGER,
   available_luna INTEGER, reserve_luna INTEGER, held_luna INTEGER DEFAULT 0, total_luna INTEGER,
-  status TEXT CHECK (status IN ('PENDING','VERIFIED','MISMATCH')),
-  opened_at_ms INTEGER, closed_at_ms INTEGER
+  status TEXT CHECK (status IN ('PENDING','VERIFIED','MISMATCH','SKIPPED')),
+  opened_at_ms INTEGER, closed_at_ms INTEGER,
+  attribution TEXT NOT NULL DEFAULT '',      -- 'tx' | 'delta' | '' (degenerate SKIPPED)
+  note TEXT NOT NULL DEFAULT ''              -- why a cycle was SKIPPED
 );
 CREATE TABLE cycle_shares (
   cycle_id INTEGER REFERENCES cycles(id),
   staker_address TEXT, expected_luna INTEGER, actual_luna INTEGER, tx_hash TEXT, ok INTEGER,
+  reason TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (cycle_id, staker_address)
 );
-CREATE TABLE staker_rewards (     -- G1 ledger: what the dashboard shows
+CREATE TABLE staker_rewards (     -- G1 ledger, one credit per staker per closing block
   staker_address TEXT, block INTEGER, amount_luna INTEGER, tx_hash TEXT, ts_ms INTEGER,
   PRIMARY KEY (staker_address, block, tx_hash)
 );
-CREATE INDEX idx_staker_rewards_addr ON staker_rewards(staker_address, ts_ms);
+CREATE TABLE epoch_stats (
+  validator TEXT, epoch INTEGER, start_block INTEGER, end_block INTEGER, micro_total INTEGER,
+  produced INTEGER, reward_count INTEGER, reward_sum_luna INTEGER, updated_at_ms INTEGER,
+  PRIMARY KEY (validator, epoch)
+);
 ```
 
-## Jobs (scheduler loop, 60s)
+Migrations are additive (`ALTER TABLE ... ADD COLUMN`) except the `cycles` CHECK constraint, which is rebuilt when an older database lacks `SKIPPED`.
 
-1. **snapshot**: fetch stakers + validator total; upsert latest row per (validator, address). Keeps history for share recomputation.
-2. **rewards ingest**: `getTransactionsByAddress(reward_addr)` via `RPC_URL`; classify inbound:
-   - from coinbase (`NQ81 C01N BASE ...`) → `rewards` row;
-   - from the validator reward address to the staking contract (`NQ77 0000 ... 0000 0001`) → restake tx (record in a `restake_txs`-style table if present; at minimum used in job 4);
-   - anything else → ignore (sentinel domain of the bot; not ours).
-   Dedup by block/hash.
-3. **cycle close**: a "cycle" = the window between consecutive restake batches from the reward wallet. When new restake txs are seen (and the previous window has a `PENDING` cycle), close it: `available_luna` = rewards inside window − `HELD` (`RESERVE_LUNA` is a wallet safety floor, not a per-cycle deduction; recorded for reference only); `total_luna` = validator snapshot at window open; recompute shares with **job 4**, set `VERIFIED`/`MISMATCH`.
-4. **verify (G2)**: for each staker snapshot taken at window open:
-   `expected_i = floor(balance_i * available / total)` (integer lunas, deterministic);
-   `actual_i` = sum of restake tx values to that staker inside the window.
-   `ok = 1` when `actual_i == expected_i`, OR (`expected_i < MIN_SHARE_LUNA` AND `actual_i == 0`) (dust floor skips it), OR `abs(actual_i - expected_i) <= 1` (rounding tolerance).
-   Two independent consistency checks determine cycle status beyond the per-line `ok`:
-   - internal drift: `abs(sum_txs - (sum_deltas + unaccounted)) > 1` → MISMATCH, reason "unaccounted restake value (possible timing drift)";
-   - honesty vs reward income: `abs(sum_txs - sum_rewards_in_window) > DUST_TOLERANCE_LUNA` → MISMATCH, reason "distribution does not match cycle rewards (possible skim)".
-   Cycle status `VERIFIED` iff every line `ok` and neither consistency check fires; else `MISMATCH` (per-line diff stored in `cycle_shares.expected/actual`).
-   Every verified/mismatched cycle lands in `staker_rewards` (the credited amounts) for G1.
+## Jobs
+
+1. **snapshot**: validator record plus every staker's active balance, time-stamped. A staker that vanishes from a non-empty list gets one zero-balance tombstone row; an empty list tombstones nobody.
+2. **ingest**: head walk from the newest tx back to `ingest_watermark_block` (at most 3 pages of 200). If the walk stops short (page cap or HTTP 429), the uncovered stretch is recorded in `ingest_gaps` and drained newest-first at `BACKFILL_PAGES_PER_POLL` pages per poll. Coinbase txs to the reward address become `rewards`; outbound txs from the reward address become `restake_txs` with the credited staker. Address comparison ignores spacing and case.
+3. **cycle close** (the only closer): window = (opened_block, closed_block], where closed_block ends the first complete payout batch after the opener (a gap above `BATCH_GAP_BLOCKS` splits batches). Up to `MAX_CLOSE_PER_TICK` cycles per poll during catch-up. Verdict math: README.
+4. **verify**: idempotent re-credit of the latest closed cycle into `staker_rewards`. It never closes or modifies a PENDING cycle.
 
 ## API (read-only, GET, JSON; errors `{"error": "..."}`)
 
-- `GET /api/health` → `{ok, db, last_run_ms}`
-- `GET /api/validators/{addr}/summary` → latest snapshot + counts + first/last rewards
-- `GET /api/validators/{addr}/stakers` → latest staker rows
-- `GET /api/validators/{addr}/cycles?limit=50` → cycles with status + totals
-- `GET /api/validators/{addr}/cycles/{cycle_id}/shares` → per-staker expected/actual/ok
-- `GET /api/validators/{addr}/stakers/{address}/rewards?limit=50` → G1 ledger rows
-- `GET /api/verify?limit=50` → recent cycles with status (for `/verify` page)
+- `GET /api/health` -> `{ok, db, last_run_ms, stale, jobs, data_age_s}`
+- `GET /api/validators/{addr}/summary`
+- `GET /api/validators/{addr}/stakers`
+- `GET /api/validators/{addr}/cycles?limit=50&before={id}` -> `{cycles, has_more}`; each cycle includes `attribution` and `note`
+- `GET /api/validators/{addr}/cycles/{cycle_id}/shares` -> `{cycle, shares}`; shares carry `expected_luna, actual_luna, ok, reason, tx_hash`
+- `GET /api/validators/{addr}/stakers/{address}/rewards?limit=50&before={block}` -> `{rewards, has_more}`
+- `GET /api/validators/{addr}/epochs`
+- `GET /api/verify?limit=50&before={id}` -> `{cycles, has_more}`
+
+`limit` is clamped to 1..500; `before` cursors are not clamped (block numbers are ~64M).
 
 ## Repo layout
 
 ```
-tracker/main.py        # entrypoint: API thread + scheduler
-tracker/db.py          # schema, connection (WAL), upserts
-tracker/jobs.py        # snapshot / ingest / cycle-close / verify
-tracker/api.py         # http.server handler (routes above)
+tracker/main.py        # entrypoint: API thread + scheduler with per-job isolation
+tracker/db.py          # schema, migrations, queries (WAL)
+tracker/jobs.py        # snapshot / ingest (+gap backfill) / cycle close / verify
+tracker/api.py         # http.server handler and health status
 tracker/config.py      # env parsing, defaults
-Dockerfile
-docker-compose.yml     # ports: "127.0.0.1:8649:8649"; volumes ./data:/data; restart unless-stopped
-tests/test_verify.py   # unittest (stdlib), fake RPC server (http.server) with canned fixtures
-tests/test_api.py      # API route tests with a temp sqlite
-README.md              # quickstart, env table, API doc, G1/G2 explainer, ImpactZero reference
-LICENSE                # MIT
+tools/register_ingest_gaps.py  # register historic reward-history holes for backfill
+tools/epoch_stats.py   # reference-deployment epoch production counter
+tests/                 # stdlib unittest; fake explorer/staker servers mirror live shapes
 ```
 
-## Constraints & acceptance
+## Constraints
 
-- `python -m unittest discover tests -v` must pass before finishing.
-- No pip installs; no runtime network beyond RPC_URL/STAKERS/VALIDATORS; no writes to anything but DATA_DIR.
-- `docker build` must succeed from repo root; compose file must be valid (validate with `docker compose config`).
-- All rendered copy in the repo README: no tab characters, no em-dashes (house style), no table syntax that breaks on narrow clients (use list lines).
-- Keep the README honest: it powers a public validator with real stakes; exact formula + exact thresholds must match the code constants.
-- Repo is PUBLIC from creation; zero secrets anywhere (no keys, no tokens).
+- `python3 -m unittest discover tests` passes before any release.
+- No pip installs; no network beyond the three configured sources; no writes outside `DATA_DIR`.
+- Public repo: zero secrets. README copy: no em-dashes; formulas and thresholds must match the code.
