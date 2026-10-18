@@ -104,6 +104,86 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
         self.assertEqual(body["db"], self.cfg.db_path())
+        self.assertIn("jobs", body)
+        self.assertIn("data_age_s", body)
+        self.assertFalse(body["stale"])
+        self.assertIsNone(body["last_run_ms"])
+        for job_name in ("snapshot", "ingest", "cycle_close", "verify"):
+            self.assertIn(job_name, body["jobs"])
+            j = body["jobs"][job_name]
+            self.assertIn("last_ok_ms", j)
+            self.assertIn("last_error", j)
+            self.assertIn("last_error_ms", j)
+        for field in ("reward", "restake", "snapshot"):
+            self.assertIn(field, body["data_age_s"])
+        # In seed(), a reward at ts_ms=1000000 and snapshot at ts_ms=1000000 were seeded
+        self.assertIsNotNone(body["data_age_s"]["reward"])
+        self.assertIsNotNone(body["data_age_s"]["snapshot"])
+        self.assertIsNone(body["data_age_s"]["restake"])
+
+    def test_health_stale_flips_ok_to_false(self):
+        now = 2_000_000_000
+        poll_s = self.cfg.poll_seconds  # 60s
+        threshold_ms = 5 * poll_s * 1000  # 300,000 ms = 300s
+        self.server.now_ms = lambda: now
+
+        # Case 1: last_run_ms within threshold -> not stale, ok is True
+        self.server.last_run_ms = now - 10_000
+        status, body = self._get("/api/health")
+        self.assertEqual(status, 200)
+        self.assertFalse(body["stale"])
+        self.assertTrue(body["ok"])
+
+        # Case 2: last_run_ms older than 5 * poll_seconds -> stale is True, ok is False
+        self.server.last_run_ms = now - (threshold_ms + 1000)
+        status, body = self._get("/api/health")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["stale"])
+        self.assertFalse(body["ok"])
+
+        # Case 3: last_run_ms is None, started_at_ms older than 5 * poll_seconds -> stale is True, ok is False
+        self.server.last_run_ms = None
+        self.server.started_at_ms = now - (threshold_ms + 1000)
+        status, body = self._get("/api/health")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["stale"])
+        self.assertFalse(body["ok"])
+
+        # Case 4: last_run_ms is None, started_at_ms is fresh (e.g. 5s ago) -> not stale, ok is True
+        self.server.started_at_ms = now - 5000
+        status, body = self._get("/api/health")
+        self.assertEqual(status, 200)
+        self.assertFalse(body["stale"])
+        self.assertTrue(body["ok"])
+
+    def test_scheduler_job_isolation(self):
+        from unittest.mock import Mock
+        from tracker.api import JobStatus
+        from tracker.main import _run_scheduler
+
+        status = JobStatus()
+        stop_event = threading.Event()
+
+        jobs = Mock()
+        jobs.run_snapshot.side_effect = RuntimeError("stakers-API timeout")
+        jobs.run_ingest.return_value = None
+        jobs.run_cycle_close.return_value = None
+        jobs.run_verify.side_effect = lambda: stop_event.set()
+
+        _run_scheduler(jobs, self.db, stop_event, 0, status=status)
+
+        # Ingest, cycle_close, and verify should still have executed
+        jobs.run_ingest.assert_called_once()
+        jobs.run_cycle_close.assert_called_once()
+        jobs.run_verify.assert_called_once()
+
+        snap = status.snapshot()
+        self.assertEqual(snap["jobs"]["snapshot"]["last_error"], "stakers-API timeout")
+        self.assertIsNotNone(snap["jobs"]["snapshot"]["last_error_ms"])
+        self.assertIsNotNone(snap["jobs"]["ingest"]["last_ok_ms"])
+        self.assertIsNotNone(snap["jobs"]["cycle_close"]["last_ok_ms"])
+        self.assertIsNotNone(snap["jobs"]["verify"]["last_ok_ms"])
+        self.assertIsNotNone(snap["last_run_ms"])
 
     def test_summary(self):
         status, body = self._get("/api/validators/%s/summary" % VALIDATOR)

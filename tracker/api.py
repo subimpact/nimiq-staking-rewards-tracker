@@ -18,15 +18,64 @@ def _query(params, key, default):
     return vals[-1]
 
 
+import threading
+import time
+
+
+class JobStatus:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.last_run_ms = None
+        self.jobs = {
+            name: {
+                "last_ok_ms": None,
+                "last_error": None,
+                "last_error_ms": None,
+            }
+            for name in ("snapshot", "ingest", "cycle_close", "verify")
+        }
+
+    def record_ok(self, job, now_ms):
+        with self._lock:
+            if job in self.jobs:
+                self.jobs[job]["last_ok_ms"] = now_ms
+
+    def record_error(self, job, error_str, now_ms):
+        with self._lock:
+            if job in self.jobs:
+                self.jobs[job]["last_error"] = str(error_str)
+                self.jobs[job]["last_error_ms"] = now_ms
+
+    def record_tick_end(self, now_ms):
+        with self._lock:
+            self.last_run_ms = now_ms
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "last_run_ms": self.last_run_ms,
+                "jobs": {k: dict(v) for k, v in self.jobs.items()},
+            }
+
+
 class APIServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, addr, db, cfg):
+    def __init__(self, addr, db, cfg, status=None):
         self.db = db
         self.cfg = cfg
+        self.status = status if status is not None else JobStatus()
         self.started_at_ms = None
-        self.last_run_ms = None
+        self.now_ms = lambda: int(time.time() * 1000)
         super().__init__(addr, Handler)
+
+    @property
+    def last_run_ms(self):
+        return self.status.last_run_ms
+
+    @last_run_ms.setter
+    def last_run_ms(self, val):
+        self.status.last_run_ms = val
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -80,10 +129,56 @@ class Handler(BaseHTTPRequestHandler):
             db_ok = True
         except Exception:
             db_ok = False
+
+        now_ms = srv.now_ms() if callable(getattr(srv, "now_ms", None)) else int(time.time() * 1000)
+        poll_seconds = srv.cfg.poll_seconds
+        threshold_ms = 5 * poll_seconds * 1000
+
+        last_run_ms = srv.last_run_ms
+        started_at_ms = srv.started_at_ms
+
+        if last_run_ms is not None:
+            stale = (now_ms - last_run_ms) > threshold_ms
+        elif started_at_ms is not None:
+            stale = (now_ms - started_at_ms) > threshold_ms
+        else:
+            stale = False
+
+        ok = bool(db_ok and not stale)
+
+        reward_age = None
+        restake_age = None
+        snapshot_age = None
+
+        if db_ok:
+            try:
+                r_row = srv.db.conn.execute("SELECT MAX(ts_ms) FROM rewards").fetchone()
+                if r_row and r_row[0] is not None:
+                    reward_age = (now_ms - int(r_row[0])) / 1000.0
+
+                rt_row = srv.db.conn.execute("SELECT MAX(ts_ms) FROM restake_txs").fetchone()
+                if rt_row and rt_row[0] is not None:
+                    restake_age = (now_ms - int(rt_row[0])) / 1000.0
+
+                ss_row = srv.db.conn.execute("SELECT MAX(fetched_at_ms) FROM staker_snapshots").fetchone()
+                if ss_row and ss_row[0] is not None:
+                    snapshot_age = (now_ms - int(ss_row[0])) / 1000.0
+            except Exception:
+                pass
+
+        snap = srv.status.snapshot()
+
         return {
-            "ok": db_ok,
+            "ok": ok,
             "db": srv.cfg.db_path(),
-            "last_run_ms": srv.last_run_ms,
+            "last_run_ms": last_run_ms,
+            "jobs": snap["jobs"],
+            "data_age_s": {
+                "reward": reward_age,
+                "restake": restake_age,
+                "snapshot": snapshot_age,
+            },
+            "stale": stale,
         }
 
     def _verify(self, params):
@@ -302,7 +397,7 @@ def _reward_json(r):
     }
 
 
-def serve(db, cfg, bind="0.0.0.0", port=None):
+def serve(db, cfg, bind="0.0.0.0", port=None, status=None):
     port = cfg.port if port is None else port
-    server = APIServer((bind, port), db, cfg)
+    server = APIServer((bind, port), db, cfg, status=status)
     return server

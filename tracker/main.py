@@ -16,15 +16,27 @@ from tracker.db import DB
 from tracker.jobs import Jobs
 
 
-def _run_scheduler(jobs, db, stop_event, interval):
+def _run_scheduler(jobs, db, stop_event, interval, status=None):
+    now_fn = lambda: int(time.time() * 1000)
     while not stop_event.is_set():
-        try:
-            jobs.run_snapshot()
-            jobs.run_ingest()
-            jobs.run_cycle_close()
-            jobs.run_verify()
-        except Exception as exc:  # noqa: BLE001
-            print("scheduler error: %s" % exc, file=sys.stderr)
+        for job_name, job_fn in (
+            ("snapshot", jobs.run_snapshot),
+            ("ingest", jobs.run_ingest),
+            ("cycle_close", jobs.run_cycle_close),
+            ("verify", jobs.run_verify),
+        ):
+            try:
+                job_fn()
+                if status is not None:
+                    status.record_ok(job_name, now_fn())
+            except Exception as exc:  # noqa: BLE001
+                print("scheduler error [%s]: %s" % (job_name, exc), file=sys.stderr)
+                if status is not None:
+                    status.record_error(job_name, str(exc), now_fn())
+
+        if status is not None:
+            status.record_tick_end(now_fn())
+
         stop_event.wait(interval)
 
 
@@ -53,7 +65,7 @@ def main():
     jobs = Jobs(db, cfg)
     scheduler = threading.Thread(
         target=_run_scheduler,
-        args=(jobs, db, stop_event, cfg.poll_seconds),
+        args=(jobs, db, stop_event, cfg.poll_seconds, server.status),
         daemon=True,
     )
     scheduler.start()
