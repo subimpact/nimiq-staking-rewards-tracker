@@ -52,7 +52,9 @@ CREATE TABLE IF NOT EXISTS cycles (
   total_luna INTEGER,
   status TEXT CHECK (status IN ('PENDING','VERIFIED','MISMATCH','SKIPPED')),
   opened_at_ms INTEGER,
-  closed_at_ms INTEGER
+  closed_at_ms INTEGER,
+  attribution TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS cycle_shares (
@@ -144,6 +146,19 @@ class DB:
             self.conn.execute(
                 "ALTER TABLE restake_txs ADD COLUMN staker_address TEXT NOT NULL DEFAULT ''"
             )
+        ccols = {
+            r["name"] for r in self.conn.execute(
+                "PRAGMA table_info(cycles)"
+            ).fetchall()
+        }
+        if "attribution" not in ccols:
+            self.conn.execute(
+                "ALTER TABLE cycles ADD COLUMN attribution TEXT NOT NULL DEFAULT ''"
+            )
+        if "note" not in ccols:
+            self.conn.execute(
+                "ALTER TABLE cycles ADD COLUMN note TEXT NOT NULL DEFAULT ''"
+            )
         # cycles.status grew a 'SKIPPED' value for degenerate windows (payouts
         # in a sub-60-block slice cannot contain the funding coinbase, so the
         # cycle cannot be verified and must not be MISMATCH). SQLite cannot
@@ -168,14 +183,16 @@ class DB:
                       total_luna INTEGER,
                       status TEXT CHECK (status IN ('PENDING','VERIFIED','MISMATCH','SKIPPED')),
                       opened_at_ms INTEGER,
-                      closed_at_ms INTEGER
+                      closed_at_ms INTEGER,
+                      attribution TEXT NOT NULL DEFAULT '',
+                      note TEXT NOT NULL DEFAULT ''
                     );
                     INSERT INTO cycles_mig (id, validator, opened_block, closed_block,
                       available_luna, reserve_luna, held_luna, total_luna, status,
-                      opened_at_ms, closed_at_ms)
+                      opened_at_ms, closed_at_ms, attribution, note)
                       SELECT id, validator, opened_block, closed_block,
                       available_luna, reserve_luna, held_luna, total_luna, status,
-                      opened_at_ms, closed_at_ms FROM cycles;
+                      opened_at_ms, closed_at_ms, attribution, note FROM cycles;
                     DROP TABLE cycles;
                     ALTER TABLE cycles_mig RENAME TO cycles;
                     """
@@ -415,11 +432,12 @@ class DB:
         return row
 
     def close_cycle(self, cycle_id, closed_block, closed_at_ms, available_luna,
-                    held_luna, status):
+                    held_luna, status, attribution="", note=""):
         self.conn.execute(
             "UPDATE cycles SET closed_block=?, closed_at_ms=?, available_luna=?, "
-            "held_luna=?, status=? WHERE id=?",
-            (closed_block, closed_at_ms, available_luna, held_luna, status, cycle_id),
+            "held_luna=?, status=?, attribution=?, note=? WHERE id=?",
+            (closed_block, closed_at_ms, available_luna, held_luna, status,
+             attribution, note, cycle_id),
         )
         self.conn.commit()
 
