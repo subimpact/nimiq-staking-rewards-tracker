@@ -7,6 +7,7 @@ JSON bodies of the form {"error": "..."} with an appropriate status code.
 
 import json
 import re
+import sys
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -89,6 +90,14 @@ class Handler(BaseHTTPRequestHandler):
         self.handle_request()
 
     def handle_request(self):
+        try:
+            self._handle_request()
+        finally:
+            # Each request runs on its own thread with its own SQLite
+            # connection; close it so finished threads do not leak handles.
+            self.server.db.release()
+
+    def _handle_request(self):
         parsed = self._parse_path(self.path)
         if parsed is None:
             self._send_json(404, {"error": "not found"})
@@ -115,8 +124,13 @@ class Handler(BaseHTTPRequestHandler):
             else:  # pragma: no cover - defensive
                 self._send_json(404, {"error": "not found"})
                 return
+        except NotFound as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
         except Exception as exc:  # noqa: BLE001
-            self._send_json(500, {"error": str(exc)})
+            # Log the detail server-side; never echo internals to clients.
+            print("api error on %s: %r" % (self.path, exc), file=sys.stderr)
+            self._send_json(500, {"error": "internal error"})
             return
         self._send_json(200, payload)
 
@@ -227,8 +241,8 @@ class Handler(BaseHTTPRequestHandler):
     def _shares(self, vaddr, cid):
         db = self.server.db
         cycle = db.get_cycle(cid)
-        if cycle is None:
-            return {"error": "cycle not found", "cycle_id": cid}
+        if cycle is None or _norm(cycle["validator"]) != _norm(vaddr):
+            raise NotFound("cycle not found")
         shares = db.cycle_shares(cid)
         return {
             "cycle": _cycle_json(cycle),
@@ -239,7 +253,8 @@ class Handler(BaseHTTPRequestHandler):
         limit = _int_param(params, "limit", 50)
         before = _before_param(params, "before")
         rows, has_more = self.server.db.staker_rewards_before(
-            self.server.cfg.validator_addr, saddr, limit, before
+            params.get("vaddr") or self.server.cfg.validator_addr, saddr, limit,
+            before,
         )
         return {"rewards": [_reward_json(r) for r in rows], "has_more": has_more}
 
@@ -254,7 +269,9 @@ class Handler(BaseHTTPRequestHandler):
             for pair in query.split("&"):
                 if "=" in pair:
                     k, _, v = pair.partition("=")
-                    params.setdefault(k, []).append(v)
+                    params.setdefault(urllib.parse.unquote_plus(k), []).append(
+                        urllib.parse.unquote_plus(v)
+                    )
 
         if path_only == "/api/health":
             return {"kind": "health", "params": params}
@@ -316,6 +333,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+class NotFound(Exception):
+    pass
+
+
+def _norm(addr):
+    return (addr or "").replace(" ", "").upper()
 
 
 def _int_param(params, key, default):

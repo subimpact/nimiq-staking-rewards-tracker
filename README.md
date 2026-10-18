@@ -40,8 +40,9 @@ For one closed window (opened_block, closed_block], all values integer lunas (1 
 
 - income = sum of coinbase rewards in the window.
 - available = income - held. `held` is 0 unless the operator's bot is holding an inbound mis-send. `RESERVE_LUNA` is NOT deducted; it is recorded for reference only.
-- denominator = sum of all stakers' active balances at window open. The validator's own deposit is excluded because the reference bot distributes the deposit's earned slice to stakers.
-- expected_i = floor(balance_i * available / denominator).
+- distributable = available - floor(available * VALIDATOR_FEE_PPM / 1,000,000). The default fee is 0, so distributable = available.
+- denominator = sum of all stakers' active balances at window open (`DENOMINATOR_MODE=stakers`, the default). The validator's own deposit is excluded because the reference bot distributes the deposit's earned slice to stakers. With `DENOMINATOR_MODE=total` the denominator is the validator's total stake at open, deposit included, so the deposit's slice stays with the operator.
+- expected_i = floor(balance_i * distributable / denominator).
 - actual_i = sum of the window's AddStake transactions that name staker i in `relatedAddresses` ("tx" attribution). For older history where the explorer did not expose that mapping, actual_i falls back to the change in the staker's active balance across the window ("delta" attribution). Each cycle records which mode it used.
 
 A staker line is OK when any of these hold:
@@ -54,7 +55,7 @@ Any underpayment of more than 1 luna fails the line. An overpayment above the du
 
 Two cycle-level checks run on top:
 
-- skim check: if the restaked total differs from the window's income by more than `DUST_TOLERANCE_LUNA`, the cycle is MISMATCH ("distribution does not match cycle rewards").
+- skim check: if the restaked total differs from what the rule says stakers are owed (the window's income minus the fee, scaled by stakers' share of the denominator in `total` mode) by more than `DUST_TOLERANCE_LUNA`, the cycle is MISMATCH ("distribution does not match cycle rewards").
 - drift check: the attributed credits must account for the restaked total within 1 luna, otherwise MISMATCH ("unaccounted restake value"). When both checks fire, both reasons are recorded.
 
 Status:
@@ -87,8 +88,9 @@ If the closing batch contains AddStake txs naming A, B and C for exactly 800,000
 
 ### Scope and limits
 
-- Built for validators that pay stakers by restaking (AddStake) in proportion to stake, at 0% fee, with the deposit's earned slice redistributed, as the open-source ImpactZero restake bot does. A validator with a fee, or one that pays by plain transfer, needs a different expected-share rule and is not supported yet.
-- Staker balances come from `STAKERS_URL_TEMPLATE`. The default is the reference operator's API mirror; point it at any source you trust.
+- Built for validators that pay stakers by restaking (AddStake) in proportion to stake, as the open-source ImpactZero restake bot does. A percentage fee (`VALIDATOR_FEE_PPM`) and a deposit-retaining split (`DENOMINATOR_MODE=total`) are supported; other rules (minimum payouts, tiered fees, payout by plain transfer) are not supported yet.
+- Staker balances come from `STAKERS_URL_TEMPLATE` (keyed on the validator address). The default is the reference operator's API mirror; point it at any source you trust.
+- A staker who vanishes from the staker list is recorded as fully unstaked only when the list is complete (at least as many rows as the validator record's staker count), so a truncated answer never books a fake unstake.
 
 ## Environment variables
 
@@ -106,6 +108,9 @@ Listed with their defaults. Thresholds mirror the ImpactZero restake bot.
 - BATCH_GAP_BLOCKS: a larger block gap between payout txs starts a new batch. Default: 10
 - MAX_CLOSE_PER_TICK: cycles closed per poll when catching up a backlog. Default: 600
 - BACKFILL_PAGES_PER_POLL: explorer pages spent per poll draining registered ingest gaps. Default: 3
+- VALIDATOR_FEE_PPM: the operator's fee in parts per million of window income (50000 = 5%). Default: 0
+- DENOMINATOR_MODE: `stakers` (deposit slice paid to stakers) or `total` (deposit slice kept by the operator). Default: stakers
+- SNAPSHOT_RETENTION_DAYS: when above 0, staker snapshots older than this many days are thinned to one per staker per hour, once a day. Cycles older than the cutoff then cannot be re-derived at minute precision. Default: 0 (keep everything)
 - DATA_DIR: directory for tracker.db. Default: /data
 - PORT: API port inside the container. Default: 8649
 - POLL_SECONDS: scheduler interval. Default: 60
@@ -113,7 +118,7 @@ Listed with their defaults. Thresholds mirror the ImpactZero restake bot.
 
 ## API endpoints
 
-All GET, all read-only, all JSON. Errors are returned as {"error": "..."}. Nimiq addresses contain spaces, so percent-encode them in the URL path (for example NQ08%20ACT8...).
+All GET, all read-only, all JSON. Errors are returned as {"error": "..."}: 404 for unknown routes and for a cycle that does not exist under the given validator, 500 with a generic message for internal failures (details go to the server log only). Nimiq addresses contain spaces, so percent-encode them in the URL path (for example NQ08%20ACT8...).
 
 - GET /api/health -> {ok, db, last_run_ms, stale, jobs, data_age_s}. `ok` is false when the database is unreachable or the scheduler has not completed a tick for 5 poll intervals. `data_age_s` gives the age in seconds of the newest reward, restake and snapshot.
 - GET /api/validators/{addr}/summary -> latest snapshot, staker count, staked total, first and last reward

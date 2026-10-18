@@ -7,6 +7,7 @@ lunas throughout (1 NIM = 1e5 lunas).
 
 import os
 import sqlite3
+import threading
 import time
 
 SCHEMA = """
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS cycle_shares (
 );
 
 CREATE TABLE IF NOT EXISTS staker_rewards (
+  validator TEXT NOT NULL DEFAULT '',
   staker_address TEXT,
   block INTEGER,
   amount_luna INTEGER,
@@ -113,19 +115,66 @@ CREATE INDEX IF NOT EXISTS idx_rw_v_block ON rewards (validator, block);
 """
 
 
+BUSY_TIMEOUT_MS = 5000
+
+
 class DB:
+    """One SQLite connection PER THREAD (2026-10-19 review, F8).
+
+    The scheduler thread writes; every API request runs on its own
+    ThreadingHTTPServer thread and reads. A single shared connection made
+    API reads run inside the writer's open transaction (seeing half-written
+    state) and risked "SQL statements in progress" errors on commit. WAL lets
+    each thread's own connection read a consistent snapshot while the writer
+    commits. `self.conn` resolves to the calling thread's connection; request
+    threads call release() when done so short-lived threads do not leak.
+    """
+
     def __init__(self, db_path):
         self.db_path = db_path
         parent = os.path.dirname(db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.executescript(SCHEMA)
-        self.conn.commit()
+        self._local = threading.local()
+        self._all = set()
+        self._all_lock = threading.Lock()
+        conn = self.conn
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(SCHEMA)
+        conn.commit()
         self._migrate()
+
+    def _connect(self):
+        conn = sqlite3.connect(
+            self.db_path, check_same_thread=False,
+            timeout=BUSY_TIMEOUT_MS / 1000.0,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    @property
+    def conn(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._connect()
+            self._local.conn = conn
+            with self._all_lock:
+                self._all.add(conn)
+        return conn
+
+    def release(self):
+        """Close the calling thread's connection (API request threads)."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            self._local.conn = None
+            with self._all_lock:
+                self._all.discard(conn)
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _migrate(self):
         cols = {
@@ -145,6 +194,15 @@ class DB:
         if "staker_address" not in rcols:
             self.conn.execute(
                 "ALTER TABLE restake_txs ADD COLUMN staker_address TEXT NOT NULL DEFAULT ''"
+            )
+        srcols = {
+            r["name"] for r in self.conn.execute(
+                "PRAGMA table_info(staker_rewards)"
+            ).fetchall()
+        }
+        if "validator" not in srcols:
+            self.conn.execute(
+                "ALTER TABLE staker_rewards ADD COLUMN validator TEXT NOT NULL DEFAULT ''"
             )
         ccols = {
             r["name"] for r in self.conn.execute(
@@ -203,7 +261,15 @@ class DB:
         self.conn.commit()
 
     def close(self):
-        self.conn.close()
+        with self._all_lock:
+            conns = list(self._all)
+            self._all.clear()
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._local = threading.local()
 
     # ---- meta ----
 
@@ -515,7 +581,7 @@ class DB:
         self.conn.commit()
 
     def credit_staker_reward(self, staker_address, block, amount_luna, tx_hash,
-                             ts_ms):
+                             ts_ms, validator=""):
         """One credit per (staker, cycle-closing block). Re-verification may
         upgrade a share's tx_hash from the boundary stand-in to the staker's
         real AddStake hash; a bare upsert would leave BOTH rows (the PK includes
@@ -527,9 +593,9 @@ class DB:
         )
         self.conn.execute(
             "INSERT INTO staker_rewards "
-            "(staker_address, block, amount_luna, tx_hash, ts_ms) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (staker_address, block, amount_luna, tx_hash, ts_ms),
+            "(validator, staker_address, block, amount_luna, tx_hash, ts_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (validator, staker_address, block, amount_luna, tx_hash, ts_ms),
         )
         self.conn.commit()
 
@@ -543,21 +609,22 @@ class DB:
         if before_block is not None:
             rows = self.conn.execute(
                 "SELECT * FROM staker_rewards WHERE staker_address=? AND block<? "
-                "ORDER BY block DESC LIMIT ?",
-                (address, before_block, limit),
+                "AND validator IN (?, '') ORDER BY block DESC LIMIT ?",
+                (address, before_block, validator, limit),
             ).fetchall()
         else:
             rows = self.conn.execute(
                 "SELECT * FROM staker_rewards WHERE staker_address=? "
-                "ORDER BY block DESC LIMIT ?",
-                (address, limit),
+                "AND validator IN (?, '') ORDER BY block DESC LIMIT ?",
+                (address, validator, limit),
             ).fetchall()
         if not rows:
             return rows, False
         oldest = rows[-1]["block"]
         older = self.conn.execute(
-            "SELECT 1 FROM staker_rewards WHERE staker_address=? AND block<? LIMIT 1",
-            (address, oldest),
+            "SELECT 1 FROM staker_rewards WHERE staker_address=? AND block<? "
+            "AND validator IN (?, '') LIMIT 1",
+            (address, oldest, validator),
         ).fetchone()
         return rows, older is not None
 
@@ -700,6 +767,22 @@ class DB:
             (validator, limit),
         ).fetchall()
         return rows
+
+    # ---- retention ----
+
+    def downsample_staker_snapshots(self, older_than_ms, bucket_ms=3600000):
+        """Keep the FIRST snapshot per (validator, address, bucket) for rows
+        older than older_than_ms; delete the rest. Returns rows deleted.
+        Opt-in (SNAPSHOT_RETENTION_DAYS): cycles older than the cutoff can
+        then no longer be re-derived at minute precision."""
+        cur = self.conn.execute(
+            "DELETE FROM staker_snapshots WHERE fetched_at_ms < ? AND rowid NOT IN ("
+            "  SELECT MIN(rowid) FROM staker_snapshots WHERE fetched_at_ms < ? "
+            "  GROUP BY validator, address, fetched_at_ms / ?)",
+            (older_than_ms, older_than_ms, bucket_ms),
+        )
+        self.conn.commit()
+        return cur.rowcount
 
     # ---- misc ----
 

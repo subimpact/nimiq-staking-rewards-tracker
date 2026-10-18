@@ -19,6 +19,7 @@ Cycle model (deterministic, integer-only):
 """
 
 import json
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -181,15 +182,18 @@ def _tx_ts(tx):
     return int(tx.get("timestamp", time.time() * 1000))
 
 
-def _staker_from_related(tx, validator_addr, contract_addr):
+def _staker_from_related(tx, validator_addr, contract_addr, reward_addr=None):
     """The explorer returns addresses spaced ('NQ27 NCB1 ...'); keep the third
     party's address exactly as sent so it matches the spaced addresses stored
-    in the snapshot tables."""
+    in the snapshot tables. The validator, the staking contract and the
+    reward wallet (when it differs from the validator, it is the sender of
+    every payout) are never the credited staker."""
     related = [str(a) for a in _tx_related(tx)]
-    v = validator_addr.replace(" ", "")
-    c = contract_addr.replace(" ", "")
+    skip = {_norm_addr(validator_addr), _norm_addr(contract_addr)}
+    if reward_addr:
+        skip.add(_norm_addr(reward_addr))
     for a in related:
-        if a and a.replace(" ", "") not in (v, c):
+        if a and _norm_addr(a) not in skip:
             return a
     return ""
 
@@ -258,7 +262,20 @@ class Jobs:
         # stakers-API outage or empty answer means "no data", not "everyone
         # left". Absence is only meaningful when the endpoint answered with
         # at least one row.
-        if present:
+        # PARTIAL-PAYLOAD GUARD (2026-10-19, F12): a truncated or paginated
+        # answer is non-empty yet omits live stakers, and tombstoning those
+        # would book a fake unstake. Tombstone only when the list is at least
+        # as long as the validator record's own staker count (when the
+        # record reports one); otherwise log and wait for a complete list.
+        api_count = 0
+        if vrow is not None:
+            api_count = int(vrow.get("numStakers") or vrow.get("stakerCount") or 0)
+        complete = bool(present) and (api_count == 0 or staker_count >= api_count)
+        if present and not complete:
+            print("snapshot: staker list has %d rows but the validator reports "
+                  "%d stakers; skipping departure tombstones this poll"
+                  % (staker_count, api_count), file=sys.stderr)
+        if complete:
             for row in self.db.latest_staker_rows(self.cfg.validator_addr):
                 addr = row["address"]
                 if addr not in present and int(row["balance_luna"] or 0) > 0:
@@ -278,6 +295,19 @@ class Jobs:
             self.db.upsert_validator_snapshot(
                 self.cfg.validator_addr, now, total_luna, num_stakers, deposit_luna
             )
+
+        self._maybe_retention(now)
+
+    def _maybe_retention(self, now):
+        """Opt-in snapshot downsampling, at most once a day (F14)."""
+        days = int(getattr(self.cfg, "snapshot_retention_days", 0) or 0)
+        if days <= 0:
+            return
+        last = self.db.get_meta("retention_last_ms")
+        if last and str(last).isdigit() and now - int(last) < 86400000:
+            return
+        self.db.downsample_staker_snapshots(now - days * 86400000)
+        self.db.set_meta("retention_last_ms", str(now))
 
     # ------------------------------------------------------------------- job 2
 
@@ -299,7 +329,9 @@ class Jobs:
 
         # Outbound from the reward address -> restake.
         if _norm_addr(sender) == norm_reward and recipient:
-            staker = _staker_from_related(tx, validator, STAKING_CONTRACT_ADDR)
+            staker = _staker_from_related(
+                tx, validator, STAKING_CONTRACT_ADDR, self.cfg.reward_addr
+            )
             self.db.upsert_restake(
                 validator, block, recipient, value, ts, tx_hash, staker
             )
@@ -718,9 +750,23 @@ class Jobs:
             for a in open_addrs
         )
         denom = staker_sum if staker_sum > 0 else total
+        # Distribution rule knobs (defaults = the reference bot: 0% fee,
+        # deposit slice redistributed). VALIDATOR_FEE_PPM takes the
+        # operator's cut off the window income; DENOMINATOR_MODE=total keeps
+        # the deposit's slice with the operator (denominator = validator
+        # total at open, deposit included).
+        fee_ppm = int(getattr(self.cfg, "validator_fee_ppm", 0) or 0)
+        fee_cut = (available * fee_ppm) // 1000000
+        distributable = available - fee_cut
+        if (getattr(self.cfg, "denominator_mode", "stakers") == "total"
+                and total > staker_sum > 0):
+            denom = total
+        payout_target = sum_rewards - fee_cut
+        if denom != staker_sum and staker_sum > 0:
+            payout_target = (payout_target * staker_sum) // denom
         for addr in sorted(open_addrs):
             balance = open_bal_map.get(addr) or 0
-            expected = (balance * available) // denom
+            expected = (balance * distributable) // denom
             expected_total += expected
             actual = actual_map[addr]
             sum_delta += actual
@@ -766,7 +812,7 @@ class Jobs:
         # distributes what it earns (within dust); if the batch sum is far from
         # the coinbase sum in the same window, the operator is skimming while
         # staying internally proportional.
-        skim = abs(sum_txs - sum_rewards) > self.cfg.dust_tolerance_luna
+        skim = abs(sum_txs - payout_target) > self.cfg.dust_tolerance_luna
 
         if drift or skim:
             status = "MISMATCH"
@@ -810,6 +856,7 @@ class Jobs:
             self.db.credit_staker_reward(
                 share["staker_address"], closed_block, credited,
                 share["tx_hash"], closed_at_ms,
+                validator=self.cfg.validator_addr,
             )
 
         self._open_pending_cycle()
@@ -832,6 +879,7 @@ class Jobs:
                 self.db.credit_staker_reward(
                     share["staker_address"], latest["closed_block"],
                     int(share["actual_luna"]), share["tx_hash"], self._now_ms(),
+                    validator=self.cfg.validator_addr,
                 )
 
 
