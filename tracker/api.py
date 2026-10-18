@@ -348,6 +348,7 @@ def _row_dict(row):
 
 
 def _cycle_json(r):
+    keys = r.keys() if hasattr(r, "keys") else ()
     return {
         "id": r["id"],
         "validator": r["validator"],
@@ -360,6 +361,8 @@ def _cycle_json(r):
         "status": r["status"],
         "opened_at_ms": r["opened_at_ms"],
         "closed_at_ms": r["closed_at_ms"],
+        "attribution": (r["attribution"] or "") if "attribution" in keys else "",
+        "note": (r["note"] or "") if "note" in keys else "",
     }
 
 

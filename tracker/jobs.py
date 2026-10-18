@@ -539,9 +539,26 @@ class Jobs:
             self.db.close_cycle(
                 pending["id"], closed_block, self._now_ms(),
                 available, held, "SKIPPED",
+                attribution="",
+                note="degenerate window: payouts without income in a sub-60-block slice",
             )
             self._open_pending_cycle()
             return
+
+        paid = {}
+        paid_raw_addr = {}
+        unmapped = []
+        for r in window:
+            saddr = r["staker_address"]
+            if saddr and saddr.strip():
+                norm = _norm_addr(saddr)
+                paid[norm] = paid.get(norm, 0) + int(r["amount_luna"])
+                if norm not in paid_raw_addr:
+                    paid_raw_addr[norm] = saddr
+            else:
+                unmapped.append(r)
+
+        mode = "tx" if (not unmapped and window) else "delta"
 
         total = int(pending["total_luna"]) or 1
         opened_at_ms = int(pending["opened_at_ms"])
@@ -565,6 +582,11 @@ class Jobs:
             )
             if b is not None:
                 boundary_hash = b[1][-1]["tx_hash"]
+
+        staker_hash_map = {}
+        for r in window:
+            if r["staker_address"]:
+                staker_hash_map[_norm_addr(r["staker_address"])] = r["tx_hash"]
 
         # Option A attribution: active balances only change via AddStake, so a
         # staker's credit is the active-balance delta between the snapshot
@@ -604,57 +626,87 @@ class Jobs:
                 excluded.add(addr)
         open_addrs -= excluded
 
-        # Guard 1: every remaining staker present at open needs a snapshot
-        # strictly after the cycle opened; otherwise the window cannot be
-        # attributed.
-        for addr in sorted(open_addrs):
-            if self.db.staker_balance_after(
-                self.cfg.validator_addr, addr, opened_at_ms, close_bound_ms
-            ) is None:
-                # Insufficient snapshots; leave the cycle PENDING.
-                return
-
         unaccounted = 0
         reason_map = {}
         actual_map = {}
-        for addr in sorted(open_addrs):
-            open_bal = open_bal_map.get(addr) or 0
-            close_bal = close_bal_map.get(addr)
-            if close_bal is None:
+        non_open_payees = []
+
+        if mode == "tx":
+            open_norm = {_norm_addr(a) for a in open_addrs}
+            for addr in sorted(open_addrs):
+                norm = _norm_addr(addr)
+                actual_map[addr] = paid.get(norm, 0)
+                open_bal = open_bal_map.get(addr) or 0
+                close_bal = close_bal_map.get(addr)
+                if close_bal is not None and (close_bal - open_bal < 0):
+                    reason_map[addr] = "unstaked during cycle"
+
+            for norm in sorted(paid.keys()):
+                if norm not in open_norm:
+                    amt = paid[norm]
+                    non_open_payees.append((norm, amt))
+                    unaccounted += amt
+        else:
+            # Mode "delta"
+            # Guard 1: every remaining staker present at open needs a snapshot
+            # strictly after the cycle opened; otherwise the window cannot be
+            # attributed. When close_bound_ms is not None, a later batch exists
+            # so the snapshot can never arrive; close SKIPPED.
+            for addr in sorted(open_addrs):
+                if self.db.staker_balance_after(
+                    self.cfg.validator_addr, addr, opened_at_ms, close_bound_ms
+                ) is None:
+                    if close_bound_ms is not None:
+                        self.db.clear_cycle_shares(pending["id"])
+                        self.db.close_cycle(
+                            pending["id"], closed_block, self._now_ms(),
+                            available, held, "SKIPPED",
+                            attribution="delta",
+                            note="insufficient snapshot coverage",
+                        )
+                        self._open_pending_cycle()
+                        return
+                    # Insufficient snapshots; leave the cycle PENDING.
+                    return
+
+            for addr in sorted(open_addrs):
+                open_bal = open_bal_map.get(addr) or 0
+                close_bal = close_bal_map.get(addr)
+                if close_bal is None:
+                    close_bal = self.db.staker_balance_after(
+                        self.cfg.validator_addr, addr, opened_at_ms, close_bound_ms
+                    )
+                    if close_bal is None:
+                        if close_bound_ms is not None:
+                            self.db.clear_cycle_shares(pending["id"])
+                            self.db.close_cycle(
+                                pending["id"], closed_block, self._now_ms(),
+                                available, held, "SKIPPED",
+                                attribution="delta",
+                                note="insufficient snapshot coverage",
+                            )
+                            self._open_pending_cycle()
+                            return
+                        return
+                    close_bal_map[addr] = close_bal
+                delta = close_bal - open_bal
+                actual_map[addr] = delta
+                if delta < 0:
+                    # Guard 2: active balance decreased (unstake).
+                    unaccounted += -delta
+                    reason_map[addr] = "unstaked during cycle"
+
+            # Guard 3: new stakers that appear mid-cycle have no open balance and
+            # cannot be attributed; count their window credit as unaccounted.
+            for addr in close_addrs - open_addrs:
                 close_bal = self.db.staker_balance_after(
                     self.cfg.validator_addr, addr, opened_at_ms, close_bound_ms
                 )
-                if close_bal is None:
-                    # Data vanished between Guard 1 and attribution; do not
-                    # guess a zero delta, leave the cycle PENDING.
-                    return
-                close_bal_map[addr] = close_bal
-            delta = close_bal - open_bal
-            actual_map[addr] = delta
-            if delta < 0:
-                # Guard 2: active balance decreased (unstake).
-                unaccounted += -delta
-                reason_map[addr] = "unstaked during cycle"
-
-        # Guard 3: new stakers that appear mid-cycle have no open balance and
-        # cannot be attributed; count their window credit as unaccounted.
-        for addr in close_addrs - open_addrs:
-            close_bal = self.db.staker_balance_after(
-                self.cfg.validator_addr, addr, opened_at_ms, close_bound_ms
-            )
-            unaccounted += close_bal or 0
+                unaccounted += close_bal or 0
 
         all_ok = True
         sum_delta = 0
         expected_total = 0
-        # Per-staker proof: when the explorer named the credited staker in
-        # relatedAddresses, each share carries that real AddStake tx hash;
-        # otherwise the boundary batch hash remains the stand-in. Keys are
-        # normalized (case/whitespace) because RPC implementations vary.
-        staker_hash_map = {}
-        for r in window:
-            if r["staker_address"]:
-                staker_hash_map[r["staker_address"].replace(" ", "").upper()] = r["tx_hash"]
         # Denominator = sum of staker ledger balances at cycle open, matching
         # what the payout engine actually distributes against (its validator
         # balance excludes the 100k deposit, so the deposit's earned slice is
@@ -690,9 +742,19 @@ class Jobs:
             all_ok = all_ok and ok
             self.db.upsert_cycle_share(
                 pending["id"], addr, expected, actual,
-                staker_hash_map.get(addr.replace(" ", "").upper()) or boundary_hash,
+                staker_hash_map.get(_norm_addr(addr)) or boundary_hash,
                 1 if ok else 0, reason,
             )
+
+        if mode == "tx":
+            for norm, amt in non_open_payees:
+                payee_addr = paid_raw_addr.get(norm, norm)
+                all_ok = False
+                self.db.upsert_cycle_share(
+                    pending["id"], payee_addr, 0, amt,
+                    staker_hash_map.get(norm) or boundary_hash,
+                    0, "payee had no opening balance (joined during cycle)",
+                )
 
         # Guard 4a: internal consistency of the attribution. The sum of on-chain
         # restakes must match the sum of attributed deltas plus any unaccounted
@@ -712,7 +774,8 @@ class Jobs:
 
         closed_at_ms = self._now_ms()
         self.db.close_cycle(
-            pending["id"], closed_block, closed_at_ms, available, held, status
+            pending["id"], closed_block, closed_at_ms, available, held, status,
+            attribution=mode, note="",
         )
 
         # Surface the drift/skim reasons on shares that have none yet.
