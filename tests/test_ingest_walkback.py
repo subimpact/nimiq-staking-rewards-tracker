@@ -70,6 +70,30 @@ from tests.fake_rpc import FakeRPC
 
 class CursorFakeRPC(FakeRPC):
     def do_POST(self):
+        fake = getattr(self.server, "fake", None)
+        if fake:
+            if getattr(fake, "fail_429", False):
+                self.send_response(429)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if getattr(fake, "fail_429_once", False):
+                fake.fail_429_once = False
+                self.send_response(429)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if getattr(fake, "fail_429_on_call", None) is not None:
+                fake._post_count = getattr(fake, "_post_count", 0) + 1
+                if fake._post_count == fake.fail_429_on_call:
+                    self.send_response(429)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+
         length = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(length).decode("utf-8"))
         result = self.server.fake.handle_rpc(req.get("method"), req.get("params", []))
