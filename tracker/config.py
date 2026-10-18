@@ -79,6 +79,17 @@ class Config:
         self.max_close_per_tick = _get_int(
             env, "MAX_CLOSE_PER_TICK", MAX_CLOSE_PER_TICK
         )
+        # Distribution rule (defaults = the reference bot): operator fee in
+        # parts per million of window income, and whether the validator
+        # deposit's earned slice goes to stakers ("stakers") or stays with the
+        # operator ("total": denominator = validator total incl. deposit).
+        self.validator_fee_ppm = _get_int(env, "VALIDATOR_FEE_PPM", 0)
+        self.denominator_mode = _get_str(env, "DENOMINATOR_MODE", "stakers").lower()
+        if self.denominator_mode not in ("stakers", "total"):
+            raise ValueError("DENOMINATOR_MODE must be 'stakers' or 'total'")
+        # Opt-in: downsample staker snapshots older than N days to one per
+        # staker per hour (0 = keep everything).
+        self.snapshot_retention_days = _get_int(env, "SNAPSHOT_RETENTION_DAYS", 0)
         self.backfill_pages_per_poll = _get_int(
             env, "BACKFILL_PAGES_PER_POLL", BACKFILL_PAGES_PER_POLL
         )
@@ -91,7 +102,8 @@ class Config:
         return os.path.join(self.data_dir, "tracker.db")
 
     def stakers_url(self):
-        return self.stakers_url_template.format(address=quote(self.reward_addr))
+        # Stakers delegate to the VALIDATOR, not to its reward wallet.
+        return self.stakers_url_template.format(address=quote(self.validator_addr))
 
     def validators_url(self):
         return self.validators_url_template

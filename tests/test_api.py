@@ -5,6 +5,7 @@ import os
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -319,11 +320,11 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(err["error"], "not found")
 
     def test_unknown_cycle_shares(self):
-        status, body = self._get(
-            "/api/validators/%s/cycles/99999/shares" % VALIDATOR
-        )
-        self.assertEqual(status, 200)
-        self.assertIn("error", body)
+        # 2026-10-19 (F16): an unknown cycle is a 404, not a 200 with an
+        # error body.
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._get("/api/validators/%s/cycles/99999/shares" % VALIDATOR)
+        self.assertEqual(ctx.exception.code, 404)
 
 
 if __name__ == "__main__":

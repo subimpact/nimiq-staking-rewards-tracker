@@ -12,12 +12,12 @@ Reference deployment: ImpactZero (NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY),
 
 - Single container, no external Python dependencies (stdlib only). Python 3.11+, base image `python:3.11-slim`, non-root user.
 - `tracker/main.py` starts a read-only HTTP API thread on `0.0.0.0:8649` inside the container (compose publishes it on `127.0.0.1:8649` only) and a scheduler that runs four jobs every `POLL_SECONDS` (60). Each job runs in its own error boundary; per-job status is exposed in `/api/health`. `SIGTERM` shuts down gracefully.
-- Data: SQLite at `DATA_DIR/tracker.db`, WAL mode, idempotent upserts.
+- Data: SQLite at `DATA_DIR/tracker.db`, WAL mode, idempotent upserts. One connection per thread (the scheduler writes; each API request reads on its own connection and closes it), busy timeout 5 s.
 - Data sources (public, read-only; the tracker never touches a validator node or its keys):
   - `RPC_URL` (default `https://rpc.nimiqwatch.com`): `getTransactionsByAddress` on the reward address, params `[address, 200, cursor_hash]`, newest first.
   - `STAKERS_URL_TEMPLATE`: staker records (`{data: [{address, balance, inactiveBalance, ...}]}`).
   - `VALIDATORS_URL_TEMPLATE`: validator list; the row whose address matches `VALIDATOR_ADDR` is used, and no validator snapshot is written if it is absent.
-- Thresholds mirror the ImpactZero restake bot: `MIN_SHARE_LUNA=500`, `DUST_TOLERANCE_LUNA=500`, `RESERVE_LUNA=0` (informational, never deducted), `BATCH_GAP_BLOCKS=10`.
+- Thresholds mirror the ImpactZero restake bot: `MIN_SHARE_LUNA=500`, `DUST_TOLERANCE_LUNA=500`, `RESERVE_LUNA=0` (informational, never deducted), `BATCH_GAP_BLOCKS=10`. Distribution rule: `VALIDATOR_FEE_PPM=0`, `DENOMINATOR_MODE=stakers`. Retention: `SNAPSHOT_RETENTION_DAYS=0` (off).
 
 ## SQLite schema
 
@@ -56,6 +56,7 @@ CREATE TABLE cycle_shares (
   PRIMARY KEY (cycle_id, staker_address)
 );
 CREATE TABLE staker_rewards (     -- G1 ledger, one credit per staker per closing block
+  validator TEXT NOT NULL DEFAULT '',        -- '' only on rows written before 2026-10-19
   staker_address TEXT, block INTEGER, amount_luna INTEGER, tx_hash TEXT, ts_ms INTEGER,
   PRIMARY KEY (staker_address, block, tx_hash)
 );
@@ -86,7 +87,7 @@ Migrations are additive (`ALTER TABLE ... ADD COLUMN`) except the `cycles` CHECK
 - `GET /api/validators/{addr}/epochs`
 - `GET /api/verify?limit=50&before={id}` -> `{cycles, has_more}`
 
-`limit` is clamped to 1..500; `before` cursors are not clamped (block numbers are ~64M).
+`limit` is clamped to 1..500; `before` cursors are not clamped (block numbers are ~64M). Query values are percent-decoded. Unknown routes and cycles that do not exist under `{addr}` return 404; internal failures return 500 `{"error": "internal error"}`.
 
 ## Repo layout
 

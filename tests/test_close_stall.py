@@ -175,6 +175,11 @@ class CatchUpTest(unittest.TestCase):
                 spread_staking_txs([EXP_A, EXP_B, EXP_C], 100, gap=1),
             ])
             self._pass(jobs)
+            # Realistic fixture (2026-10-19): the validator record's staker
+            # count follows the departure, as the live API does. A list
+            # shorter than the record's count is treated as partial and
+            # never tombstones (see test_partial_staker_list_never_tombstones).
+            fake.set_validator(TOTAL_LUNA - 40000000, 2)
             self._pass(jobs)
 
             cycles = [c for c in db.recent_cycles(VALIDATOR, 10)]
