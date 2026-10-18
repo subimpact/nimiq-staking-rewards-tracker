@@ -223,10 +223,12 @@ class Jobs:
             None,
         )
         if vrow is None:
-            vrow = _first_payload(validator_payload)
-        total_luna = int(vrow.get("balance") or vrow.get("total") or vrow.get("totalStake") or 0)
-        api_num_stakers = int(vrow.get("numStakers") or vrow.get("stakerCount") or 0)
-        deposit_luna = int(vrow.get("deposit") or vrow.get("validatorDeposit") or 0)
+            if isinstance(validator_payload, dict) and not isinstance(validator_payload.get("data"), list):
+                addr = validator_payload.get("address")
+                if not addr or addr.replace(" ", "").lower() == ours:
+                    vrow = validator_payload
+            elif len(vrows) == 1 and isinstance(vrows[0], dict) and not vrows[0].get("address"):
+                vrow = vrows[0]
 
         # Write staker rows first so their sum is available for the deposit.
         staker_sum = 0
@@ -266,12 +268,16 @@ class Jobs:
 
         # Deposit is not exposed by the API; derive it as total minus the sum
         # of staker records when both are present (100000 NIM when known).
-        if deposit_luna == 0 and total_luna > 0 and staker_sum > 0 and staker_count > 0:
-            deposit_luna = max(total_luna - staker_sum, 0)
-        num_stakers = staker_count if staker_count > 0 else api_num_stakers
-        self.db.upsert_validator_snapshot(
-            self.cfg.validator_addr, now, total_luna, num_stakers, deposit_luna
-        )
+        if vrow is not None:
+            total_luna = int(vrow.get("balance") or vrow.get("total") or vrow.get("totalStake") or 0)
+            api_num_stakers = int(vrow.get("numStakers") or vrow.get("stakerCount") or 0)
+            deposit_luna = int(vrow.get("deposit") or vrow.get("validatorDeposit") or 0)
+            if deposit_luna == 0 and total_luna > 0 and staker_sum > 0 and staker_count > 0:
+                deposit_luna = max(total_luna - staker_sum, 0)
+            num_stakers = staker_count if staker_count > 0 else api_num_stakers
+            self.db.upsert_validator_snapshot(
+                self.cfg.validator_addr, now, total_luna, num_stakers, deposit_luna
+            )
 
     # ------------------------------------------------------------------- job 2
 
