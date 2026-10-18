@@ -425,6 +425,46 @@ class VerifyTest(unittest.TestCase):
             shares = db.cycle_shares(cycle["id"])
             self.assertTrue(all(s["ok"] == 1 for s in shares))
             self.assertTrue(all(
+                s["reason"]
+                == "unaccounted restake value (possible timing drift); distribution does not match cycle rewards (possible skim)"
+                for s in shares
+            ))
+        finally:
+            db.close()
+            fake.close()
+
+    def test_pure_drift_without_skim(self):
+        # When drift fires but batch sum matches coinbase rewards, only drift reason is recorded.
+        fake, db, cfg, jobs = base_env()
+        try:
+            s_a = EXP_A
+            s_b = EXP_B
+            s_c = EXP_C - 100
+            extra = 100
+            stage_open_close(
+                fake,
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                    staker_row(STAKER_C, 30000000),
+                ],
+                [
+                    staker_row(STAKER_A, 40000000 + s_a),
+                    staker_row(STAKER_B, 30000000 + s_b),
+                    staker_row(STAKER_C, 30000000 + s_c),
+                ],
+            )
+            fake.set_staged_txs([
+                [coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0")],
+                closing_restakes([s_a, s_b, s_c, extra]),
+            ])
+            run_two_pass(jobs)
+
+            cycles = closed_cycle(db)
+            cycle = cycles[0]
+            self.assertEqual(cycle["status"], "MISMATCH")
+            shares = db.cycle_shares(cycle["id"])
+            self.assertTrue(all(
                 s["reason"] == "unaccounted restake value (possible timing drift)"
                 for s in shares
             ))
@@ -472,6 +512,48 @@ class VerifyTest(unittest.TestCase):
                 == "distribution does not match cycle rewards (possible skim)"
                 for s in shares
             ))
+        finally:
+            db.close()
+            fake.close()
+
+    def test_drift_and_skim_both_detected(self):
+        # When both drift (internal sum discrepancy) and skim (batch sum far
+        # from coinbase) fire, shares get the combined reason.
+        fake, db, cfg, jobs = base_env()
+        try:
+            skim_batch_total = 1700000
+            s_a = (40000000 * skim_batch_total) // TOTAL_LUNA
+            s_b = (30000000 * skim_batch_total) // TOTAL_LUNA
+            s_c = (30000000 * skim_batch_total) // TOTAL_LUNA
+            extra = 50000  # extra restake with no staker delta -> drift
+            stage_open_close(
+                fake,
+                [
+                    staker_row(STAKER_A, 40000000),
+                    staker_row(STAKER_B, 30000000),
+                    staker_row(STAKER_C, 30000000),
+                ],
+                [
+                    staker_row(STAKER_A, 40000000 + s_a),
+                    staker_row(STAKER_B, 30000000 + s_b),
+                    staker_row(STAKER_C, 30000000 + s_c),
+                ],
+            )
+            fake.set_staged_txs([
+                [coinbase_tx(50, COINBASE_AMOUNT, "tx-cb-0")],
+                closing_restakes([s_a, s_b, s_c, extra]),
+            ])
+            run_two_pass(jobs)
+
+            cycles = closed_cycle(db)
+            cycle = cycles[0]
+            self.assertEqual(cycle["status"], "MISMATCH")
+            shares = db.cycle_shares(cycle["id"])
+            expected_reason = (
+                "unaccounted restake value (possible timing drift); "
+                "distribution does not match cycle rewards (possible skim)"
+            )
+            self.assertTrue(all(s["reason"] == expected_reason for s in shares))
         finally:
             db.close()
             fake.close()
