@@ -71,7 +71,7 @@ class Config:
         self.reward_addr = _get_str(env, "REWARD_ADDR", self.validator_addr)
         self.min_trigger_luna = _get_int(env, "MIN_TRIGGER_LUNA", 2000)
         self.min_share_luna = _get_int(env, "MIN_SHARE_LUNA", 500)
-        self.reserve_luna = _get_int(env, "RESERVE_LUNA", 100000)
+        self.reserve_luna = _get_int(env, "RESERVE_LUNA", 0)
         self.dust_tolerance_luna = _get_int(
             env, "DUST_TOLERANCE_LUNA", DUST_TOLERANCE_LUNA
         )

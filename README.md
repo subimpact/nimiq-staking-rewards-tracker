@@ -1,15 +1,15 @@
 # Nimiq Staking Rewards Tracker
 
-Standard staking-rewards tracking (G1) plus on-chain integrity verification (G2) for Nimiq Albatross validators. Runs entirely from the Python 3.11 standard library inside a single container, exposes a read-only HTTP API, and writes nothing but a local SQLite database under the mounted data directory.
+Standard staking-rewards tracking (G1) plus on-chain integrity verification (G2) for Nimiq Albatross validators that pay stakers by restaking. Runs entirely from the Python 3.11 standard library inside a single container, exposes a read-only HTTP API, and writes nothing but a local SQLite database under the mounted data directory.
 
 Answers the two community gaps from [core-rs-albatross #3170](https://github.com/nimiq/core-rs-albatross/issues/3170) and [#3171](https://github.com/nimiq/core-rs-albatross/issues/3171):
 
-- G1: a per-staker rewards ledger (stake, pool share, every credited reward with its tx hash, compounding history).
-- G2: distribution integrity. Every restake cycle is recomputed from chain state and compared with the actual on-chain restake transactions. Each cycle is labelled VERIFIED, MISMATCH or SKIPPED and the math is shown line by line.
+- G1: a per-staker rewards ledger (stake, pool share, every credited reward with its own AddStake tx hash, compounding history).
+- G2: distribution integrity. Every payout cycle is recomputed from chain data and compared with the actual on-chain AddStake transactions. Each cycle is labelled VERIFIED, MISMATCH or SKIPPED and the per-staker math is stored line by line.
 
 Reference deployment: the ImpactZero validator (0% fee, NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY). Live UI at nimiq.subimpact.net.
 
-Read [SPEC.md](SPEC.md) for the exact schema, job definitions and API contract.
+Read [SPEC.md](SPEC.md) for the schema and API contract.
 
 ## Quickstart
 
@@ -24,80 +24,109 @@ The API is bound to 127.0.0.1 on the host and only exposes 8649 inside. State is
 
 The process starts two things:
 
-1. A read-only HTTP API thread on 0.0.0.0:8649.
-2. A scheduler loop that runs four jobs every 60 seconds.
+1. A read-only HTTP API thread on 0.0.0.0:8649 (inside the container).
+2. A scheduler loop that runs four jobs every 60 seconds. Each job runs in isolation: a failure in one (for example a slow staker API) is logged and reported in `/api/health`, and the other jobs still run.
 
 ### The four jobs
 
-- snapshot: fetches the validator total and every staker's balance, and upserts a time-stamped row for each. Keeps history so shares can be recomputed at the moment a cycle opens.
-- rewards ingest: calls `getTransactionsByAddress` on the reward address and classifies inbound transactions. Coinbase block rewards become `rewards` rows; outbound restakes from the reward wallet are recorded as restake transactions. Everything else is ignored.
-- cycle close: a cycle is the window between consecutive restake batches. When a new restake batch appears, the previous window closes, its reward is distributed (minus reserve and held amounts) and the cycle is verified.
-- verify (G2): recomputes each staker's expected share from chain state and compares it with the actual restake transactions in the window.
+- snapshot: fetches the validator record and every staker's active balance and stores a time-stamped row for each. These opening balances are the weights for the expected shares.
+- ingest: reads the reward address history from the public explorer (`getTransactionsByAddress`, newest first, hash-cursor pagination). Coinbase rewards become `rewards` rows; outbound transactions from the reward address become `restake_txs` rows, each carrying the staker it credits (the explorer's `relatedAddresses`). After any outage the head walk reads back to the previous high-water mark; if the outage was longer than the per-poll page budget, the remainder is registered as a gap and drained a few pages per poll until it is closed, so no outage loses data.
+- cycle close: a cycle is the window between consecutive payout batches (a batch is a run of AddStake txs whose blocks are at most `BATCH_GAP_BLOCKS` apart). When the next complete batch exists, the open window is verified and closed. This is the only code path that closes cycles.
+- verify: re-credits the latest closed cycle into the G1 ledger (idempotent).
 
-### G2 and G1
+### G2: the verification math
 
-G2 is the verifier. For a closed cycle:
+For one closed window (opened_block, closed_block], all values integer lunas (1 NIM = 100,000 lunas):
 
-- available = sum of rewards in the window - RESERVE_LUNA - held.
-- total = the validator's total stake at window open.
-- expected_i = floor(balance_i * available / total), all in integer lunas.
-- actual_i = sum of the restake values sent to that staker in the window.
-- A staker line is OK when actual_i equals expected_i, or when expected_i is below MIN_SHARE_LUNA and actual_i is zero (the bot's integer floor can round a dust share to zero), or when abs(actual_i - expected_i) <= 1 (rounding tolerance).
+- income = sum of coinbase rewards in the window.
+- available = income - held. `held` is 0 unless the operator's bot is holding an inbound mis-send. `RESERVE_LUNA` is NOT deducted; it is recorded for reference only.
+- denominator = sum of all stakers' active balances at window open. The validator's own deposit is excluded because the reference bot distributes the deposit's earned slice to stakers.
+- expected_i = floor(balance_i * available / denominator).
+- actual_i = sum of the window's AddStake transactions that name staker i in `relatedAddresses` ("tx" attribution). For older history where the explorer did not expose that mapping, actual_i falls back to the change in the staker's active balance across the window ("delta" attribution). Each cycle records which mode it used.
 
-The cycle is VERIFIED only when every staker line is OK; otherwise it is MISMATCH, with the per-line expected and actual stored in `cycle_shares`. A cycle is SKIPPED when its window is shorter than a block-reward interval (60 blocks) yet contains payouts: such a slice cannot contain the income that funds its payouts, so there is nothing to verify and no verdict is issued.
+A staker line is OK when any of these hold:
 
-G1 is the ledger. Every OK staker line from a verified or mismatched cycle is credited into `staker_rewards`, which is what the dashboard shows. Mismatched stakers are not credited.
+- actual_i equals expected_i, or differs by at most 1 luna (integer flooring);
+- actual_i exceeds expected_i by at most `DUST_TOLERANCE_LUNA` (500 luna = 0.005 NIM): the bot sweeps a few lunas of dust and its live staker view lags the snapshots slightly;
+- expected_i is below `MIN_SHARE_LUNA` and actual_i is 0.
 
-### Worked formula example
+Any underpayment of more than 1 luna fails the line. An overpayment above the dust tolerance fails with "credit exceeds expected share". A payee with no opening balance (joined during the window) gets its own failing line.
 
-Take the constants from the code: RESERVE_LUNA = 100000, MIN_SHARE_LUNA = 500, 1 NIM = 100000 lunas.
+Two cycle-level checks run on top:
 
-A cycle earns a coinbase block reward of 2000000 lunas (20 NIM), so:
+- skim check: if the restaked total differs from the window's income by more than `DUST_TOLERANCE_LUNA`, the cycle is MISMATCH ("distribution does not match cycle rewards").
+- drift check: the attributed credits must account for the restaked total within 1 luna, otherwise MISMATCH ("unaccounted restake value"). When both checks fire, both reasons are recorded.
 
-- available = 2000000 - 100000 = 1900000 lunas.
+Status:
 
-At window open the validator total is 100000000 lunas (1000 NIM), with three stakers:
+- VERIFIED: every line OK and neither cycle check fires.
+- MISMATCH: anything else. Per-line expected and actual are stored in `cycle_shares` with a reason.
+- SKIPPED: the window cannot be judged. Either it is shorter than one reward interval (60 blocks) yet contains payouts (its funding income sits in the neighbouring window), or, in delta mode only, a staker has no balance snapshot inside the window and none can arrive any more. SKIPPED cycles carry a note, credit nothing and are never counted as verified.
 
-- A: balance 40000000 lunas (400 NIM)
-- B: balance 30000000 lunas (300 NIM)
-- C: balance 30000000 lunas (300 NIM)
+Reading a MISMATCH: the reference bot pays about one minute after rewards land, so a window boundary can fall between a reward and the payout it funds. That shows up as two neighbouring cycles that each miss by about one payout and reconcile as a pair. It is flagged, never hidden; the per-line data lets anyone check the pair.
 
-expected_A = floor(40000000 * 1900000 / 100000000) = 760000 lunas (7.6 NIM)
-expected_B = floor(30000000 * 1900000 / 100000000) = 570000 lunas (5.7 NIM)
-expected_C = floor(30000000 * 1900000 / 100000000) = 570000 lunas (5.7 NIM)
+G1 is the ledger: every OK staker line from a closed cycle is credited into `staker_rewards`, one row per staker per cycle, carrying the staker's own AddStake tx hash.
 
-If the closing restake batch sends exactly 760000, 570000 and 570000 lunas, every line is OK and the cycle is VERIFIED. If any line differs by more than the tolerance, that line fails and the cycle is MISMATCH.
+### Worked example
+
+A window earns one coinbase of 2,000,000 lunas (20 NIM); held = 0, so available = 2,000,000.
+
+At window open three stakers hold:
+
+- A: 40,000,000 lunas (400 NIM)
+- B: 30,000,000 lunas (300 NIM)
+- C: 30,000,000 lunas (300 NIM)
+
+denominator = 100,000,000 lunas.
+
+- expected_A = floor(40,000,000 * 2,000,000 / 100,000,000) = 800,000 lunas (8 NIM)
+- expected_B = floor(30,000,000 * 2,000,000 / 100,000,000) = 600,000 lunas (6 NIM)
+- expected_C = 600,000 lunas (6 NIM)
+
+If the closing batch contains AddStake txs naming A, B and C for exactly 800,000, 600,000 and 600,000 lunas, every line is OK, the batch total equals the income, and the cycle is VERIFIED. If B received 590,000, B's line fails (underpaid by 10,000) and so does the skim check (the batch is 10,000 short of the income): MISMATCH.
+
+### Scope and limits
+
+- Built for validators that pay stakers by restaking (AddStake) in proportion to stake, at 0% fee, with the deposit's earned slice redistributed, as the open-source ImpactZero restake bot does. A validator with a fee, or one that pays by plain transfer, needs a different expected-share rule and is not supported yet.
+- Staker balances come from `STAKERS_URL_TEMPLATE`. The default is the reference operator's API mirror; point it at any source you trust.
 
 ## Environment variables
 
-Listed with their defaults. Every threshold mirrors the ImpactZero restake bot.
+Listed with their defaults. Thresholds mirror the ImpactZero restake bot.
 
 - RPC_URL: JSON-RPC endpoint for `getTransactionsByAddress`. Default: https://rpc.nimiqwatch.com
 - STAKERS_URL_TEMPLATE: URL template for staker records, with {address} substituted. Default: https://nimiq-api.subimpact.net/api/stakers/{address}
-- VALIDATORS_URL_TEMPLATE: URL template for the validator record. Default: https://nimiq-api.subimpact.net/api/validators
+- VALIDATORS_URL_TEMPLATE: URL for the validator list. Default: https://nimiq-api.subimpact.net/api/validators
 - VALIDATOR_ADDR: the validator being tracked. Default: NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY
 - REWARD_ADDR: the reward wallet that receives coinbases and sends restakes. Default: same as VALIDATOR_ADDR
-- MIN_TRIGGER_LUNA: restake trigger threshold in lunas. Default: 2000
-- MIN_SHARE_LUNA: dust floor; shares below this with no restake are considered OK. Default: 500
-- RESERVE_LUNA: amount of each reward held back as reserve. Default: 100000
-- DATA_DIR: host directory for tracker.db. Default: /data
+- MIN_TRIGGER_LUNA: the bot's restake trigger threshold, informational. Default: 2000
+- MIN_SHARE_LUNA: shares below this with no payout are OK. Default: 500
+- DUST_TOLERANCE_LUNA: allowed overpayment per line and allowed batch-vs-income difference. Default: 500
+- RESERVE_LUNA: the bot's wallet floor, recorded for reference, never deducted. Default: 0
+- BATCH_GAP_BLOCKS: a larger block gap between payout txs starts a new batch. Default: 10
+- MAX_CLOSE_PER_TICK: cycles closed per poll when catching up a backlog. Default: 600
+- BACKFILL_PAGES_PER_POLL: explorer pages spent per poll draining registered ingest gaps. Default: 3
+- DATA_DIR: directory for tracker.db. Default: /data
 - PORT: API port inside the container. Default: 8649
 - POLL_SECONDS: scheduler interval. Default: 60
-- LOG_FILE: optional read-only log file for cycle boundary markers (informational only). Default: empty
+- LOG_FILE: optional read-only bot log, informational only. Default: empty
 
 ## API endpoints
 
-All GET, all read-only, all JSON. Errors are returned as {"error": "..."}. Nimiq addresses contain spaces, so percent-encode them in the URL path (for example the validator address above becomes NQ08%20ACT8...).
+All GET, all read-only, all JSON. Errors are returned as {"error": "..."}. Nimiq addresses contain spaces, so percent-encode them in the URL path (for example NQ08%20ACT8...).
 
-- GET /api/health -> {ok, db, last_run_ms}
+- GET /api/health -> {ok, db, last_run_ms, stale, jobs, data_age_s}. `ok` is false when the database is unreachable or the scheduler has not completed a tick for 5 poll intervals. `data_age_s` gives the age in seconds of the newest reward, restake and snapshot.
 - GET /api/validators/{addr}/summary -> latest snapshot, staker count, staked total, first and last reward
 - GET /api/validators/{addr}/stakers -> latest snapshot per staker
-- GET /api/validators/{addr}/cycles?limit=50 -> recent cycles with status and totals
-- GET /api/validators/{addr}/cycles/{cycle_id}/shares -> per-staker expected, actual and ok
-- GET /api/validators/{addr}/stakers/{address}/rewards?limit=50 -> the G1 ledger for one staker
-- GET /api/verify?limit=50 -> recent cycles with status, for the /verify page
+- GET /api/validators/{addr}/cycles?limit=50&before={id} -> recent cycles with status, attribution mode and note; `has_more` for paging
+- GET /api/validators/{addr}/cycles/{cycle_id}/shares -> per-staker expected, actual, ok, reason and tx hash
+- GET /api/validators/{addr}/stakers/{address}/rewards?limit=50&before={block} -> the G1 ledger for one staker
+- GET /api/verify?limit=50&before={id} -> recent cycles with status, for the /verify page
 
-All money values are integers in lunas (1 NIM = 100000 lunas). NIM decimal amounts appear only in examples here.
+## Tools
+
+- tools/register_ingest_gaps.py --db PATH [--dry-run]: finds holes in the stored reward history and registers them for the ingest job to backfill.
+- tools/epoch_stats.py: host-side epoch production counter for the reference deployment (reads block producers through the operator's own node).
 
 ## Development
 
@@ -107,7 +136,7 @@ Run the tests (stdlib unittest only, no installs):
 python3 -m unittest discover tests -v
 ```
 
-The tests spin up a fake RPC server using the standard library http.server with canned fixtures, including a fully verified cycle with three stakers and a mismatched cycle.
+The tests drive the real fetcher against local fake explorer and staker servers that mirror the live response shapes (spaced addresses, `relatedAddresses`, hash-cursor pagination, HTTP 429).
 
 ## License
 
