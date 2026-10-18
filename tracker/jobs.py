@@ -290,13 +290,15 @@ class Jobs:
         ts = _tx_ts(tx)
         tx_hash = _tx_hash(tx)
 
+        norm_reward = _norm_addr(self.cfg.reward_addr)
+
         # Inbound coinbase block reward -> rewards row.
-        if _is_coinbase(sender) and recipient == self.cfg.reward_addr:
+        if _is_coinbase(sender) and _norm_addr(recipient) == norm_reward:
             self.db.upsert_reward(validator, block, value, ts, tx_hash)
             return
 
         # Outbound from the reward address -> restake.
-        if sender == self.cfg.reward_addr and recipient:
+        if _norm_addr(sender) == norm_reward and recipient:
             staker = _staker_from_related(tx, validator, STAKING_CONTRACT_ADDR)
             self.db.upsert_restake(
                 validator, block, recipient, value, ts, tx_hash, staker
@@ -808,6 +810,10 @@ def _list_payload(payload):
     if isinstance(payload, list):
         return payload
     return []
+
+
+def _norm_addr(addr):
+    return (addr or "").replace(" ", "").upper()
 
 
 def _is_coinbase(sender):
