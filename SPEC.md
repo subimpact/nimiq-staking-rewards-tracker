@@ -17,7 +17,7 @@ Reference deployment: ImpactZero (NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY),
   - `RPC_URL` (default `https://rpc.nimiqwatch.com`): `getTransactionsByAddress` on the reward address, params `[address, 200, cursor_hash]`, newest first.
   - `STAKERS_URL_TEMPLATE`: staker records (`{data: [{address, balance, inactiveBalance, ...}]}`).
   - `VALIDATORS_URL_TEMPLATE`: validator list; the row whose address matches `VALIDATOR_ADDR` is used, and no validator snapshot is written if it is absent.
-- Thresholds mirror the ImpactZero restake bot: `MIN_SHARE_LUNA=500`, `DUST_TOLERANCE_LUNA=500`, `RESERVE_LUNA=0` (informational, never deducted), `BATCH_GAP_BLOCKS=10`. Distribution rule: `VALIDATOR_FEE_PPM=0`, `DENOMINATOR_MODE=stakers`. Retention: `SNAPSHOT_RETENTION_DAYS=0` (off).
+- Thresholds mirror the ImpactZero restake bot: `MIN_SHARE_LUNA=500`, `DUST_TOLERANCE_LUNA=500`, `RESERVE_LUNA=0` (informational, never deducted), `BATCH_GAP_BLOCKS=10`. Distribution rule: `VALIDATOR_FEE_PPM=0`, `DENOMINATOR_MODE=stakers`, `PAYOUT_MODE=restake`, `OPERATOR_ADDRS` empty. Carry rule (M1): `CARRY_MAX_BATCHES=1`, `CARRY_DUST_LUNA=10000`, `SHARE_TOLERANCE_PPM=10`; see README "Check 1: the carried balance". Retention: `SNAPSHOT_RETENTION_DAYS=0` (off).
 
 ## SQLite schema
 
@@ -47,7 +47,9 @@ CREATE TABLE cycles (
   status TEXT CHECK (status IN ('PENDING','VERIFIED','MISMATCH','SKIPPED')),
   opened_at_ms INTEGER, closed_at_ms INTEGER,
   attribution TEXT NOT NULL DEFAULT '',      -- 'tx' | 'delta' | '' (degenerate SKIPPED)
-  note TEXT NOT NULL DEFAULT ''              -- why a cycle was SKIPPED
+  note TEXT NOT NULL DEFAULT '',             -- why a cycle was SKIPPED, or "carry baseline established"
+  carry_luna INTEGER,                        -- undistributed balance owed to stakers after this cycle (NULL before M1)
+  fee_carry_luna INTEGER                     -- operator entitlement not yet withdrawn
 );
 CREATE TABLE cycle_shares (
   cycle_id INTEGER REFERENCES cycles(id),
@@ -67,7 +69,7 @@ CREATE TABLE epoch_stats (
 );
 ```
 
-Migrations are additive (`ALTER TABLE ... ADD COLUMN`) except the `cycles` CHECK constraint, which is rebuilt when an older database lacks `SKIPPED`.
+Migrations are additive (`ALTER TABLE ... ADD COLUMN`; the carry columns are added after the CHECK rebuild so a rebuild cannot drop them) except the `cycles` CHECK constraint, which is rebuilt when an older database lacks `SKIPPED`.
 
 ## Jobs
 

@@ -55,7 +55,9 @@ CREATE TABLE IF NOT EXISTS cycles (
   opened_at_ms INTEGER,
   closed_at_ms INTEGER,
   attribution TEXT NOT NULL DEFAULT '',
-  note TEXT NOT NULL DEFAULT ''
+  note TEXT NOT NULL DEFAULT '',
+  carry_luna INTEGER,
+  fee_carry_luna INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS cycle_shares (
@@ -258,6 +260,18 @@ class DB:
                 self.conn.commit()
             finally:
                 self.conn.execute("PRAGMA foreign_keys=ON")
+        # Carry-aware verification (M1): undistributed balance after each
+        # cycle. Added AFTER the SKIPPED rebuild above so a rebuild of a very
+        # old table cannot drop them. NULL = closed before M1 (no baseline).
+        ccols = {
+            r["name"] for r in self.conn.execute(
+                "PRAGMA table_info(cycles)"
+            ).fetchall()
+        }
+        if "carry_luna" not in ccols:
+            self.conn.execute("ALTER TABLE cycles ADD COLUMN carry_luna INTEGER")
+        if "fee_carry_luna" not in ccols:
+            self.conn.execute("ALTER TABLE cycles ADD COLUMN fee_carry_luna INTEGER")
         self.conn.commit()
 
     def close(self):
@@ -498,14 +512,26 @@ class DB:
         return row
 
     def close_cycle(self, cycle_id, closed_block, closed_at_ms, available_luna,
-                    held_luna, status, attribution="", note=""):
+                    held_luna, status, attribution="", note="", carry_luna=None,
+                    fee_carry_luna=None):
         self.conn.execute(
             "UPDATE cycles SET closed_block=?, closed_at_ms=?, available_luna=?, "
-            "held_luna=?, status=?, attribution=?, note=? WHERE id=?",
+            "held_luna=?, status=?, attribution=?, note=?, carry_luna=?, "
+            "fee_carry_luna=? WHERE id=?",
             (closed_block, closed_at_ms, available_luna, held_luna, status,
-             attribution, note, cycle_id),
+             attribution, note, carry_luna, fee_carry_luna, cycle_id),
         )
         self.conn.commit()
+
+    def max_recent_reward(self, validator, at_block, n=10):
+        """Largest single coinbase among the last n rewards at or before
+        at_block (the carry limit's unit), or None when there are none."""
+        row = self.conn.execute(
+            "SELECT MAX(amount_luna) AS m FROM (SELECT amount_luna FROM rewards "
+            "WHERE validator=? AND block<=? ORDER BY block DESC LIMIT ?)",
+            (validator, at_block, n),
+        ).fetchone()
+        return row["m"] if row is not None else None
 
     def get_cycle(self, cycle_id):
         row = self.conn.execute(

@@ -36,59 +36,69 @@ The process starts two things:
 
 ### G2: the verification math
 
-For one closed window (opened_block, closed_block], all values integer lunas (1 NIM = 100,000 lunas):
+For one closed window (opened_block, closed_block], all values integer lunas (1 NIM = 100,000 lunas). A window ends on the last transaction of a payout batch.
 
-- income = sum of coinbase rewards in the window.
-- available = income - held. `held` is 0 unless the operator's bot is holding an inbound mis-send. `RESERVE_LUNA` is NOT deducted; it is recorded for reference only.
-- distributable = available - floor(available * VALIDATOR_FEE_PPM / 1,000,000). The default fee is 0, so distributable = available.
-- denominator = sum of all stakers' active balances at window open (`DENOMINATOR_MODE=stakers`, the default). The validator's own deposit is excluded because the reference bot distributes the deposit's earned slice to stakers. With `DENOMINATOR_MODE=total` the denominator is the validator's total stake at open, deposit included, so the deposit's slice stays with the operator.
-- expected_i = floor(balance_i * distributable / denominator).
-- actual_i = sum of the window's AddStake transactions that name staker i in `relatedAddresses` ("tx" attribution). For older history where the explorer did not expose that mapping, actual_i falls back to the change in the staker's active balance across the window ("delta" attribution). Each cycle records which mode it used.
+What the window earned:
 
-A staker line is OK when any of these hold:
+- income = sum of coinbase rewards in the window; available = income - held. `held` is 0 unless the operator's bot is holding an inbound mis-send. `RESERVE_LUNA` is NOT deducted; it is recorded for reference only.
+- owed = what the rule says stakers get from that income: available minus the operator fee (`VALIDATOR_FEE_PPM`, default 0), scaled by the stakers' share of the denominator when `DENOMINATOR_MODE=total` (the deposit's slice then stays with the operator). With the defaults, owed = available.
 
-- actual_i equals expected_i, or differs by at most 1 luna (integer flooring);
-- actual_i exceeds expected_i by at most `DUST_TOLERANCE_LUNA` (500 luna = 0.005 NIM): the bot sweeps a few lunas of dust and its live staker view lags the snapshots slightly;
-- expected_i is below `MIN_SHARE_LUNA` and actual_i is 0.
+What left the reward wallet:
 
-Any underpayment of more than 1 luna fails the line. An overpayment above the dust tolerance fails with "credit exceeds expected share". A payee with no opening balance (joined during the window) gets its own failing line.
+- every outbound transaction in the window is one of: a staker payout, an operator fee withdrawal (recipient in `OPERATOR_ADDRS`), or a stray payment. Which outbound kind counts as a payout is `PAYOUT_MODE`: `restake` (AddStake to the staking contract, the default and the ImpactZero bot), `transfer` (plain transfer to the staker's own address) or `any`. A stray payment always fails the cycle with its own line.
+- actual_i = sum of the window's payouts that name staker i: for a restake the staker comes from the explorer's `relatedAddresses`, for a transfer it is the recipient ("tx" attribution). For older history where the explorer did not expose the mapping, actual_i falls back to the change in the staker's active balance across the window ("delta" attribution). Each cycle records which mode it used.
 
-Two cycle-level checks run on top:
+#### Check 1: the carried balance
 
-- skim check: if the restaked total differs from what the rule says stakers are owed (the window's income minus the fee, scaled by stakers' share of the denominator in `total` mode) by more than `DUST_TOLERANCE_LUNA`, the cycle is MISMATCH ("distribution does not match cycle rewards").
-- drift check: the attributed credits must account for the restaked total within 1 luna, otherwise MISMATCH ("unaccounted restake value"). When both checks fire, both reasons are recorded.
+The reference bot sweeps its wallet about one minute after a coinbase lands, so a window boundary regularly falls between a reward and the payout that distributes it: one window holds the income, the next the payout. Instead of demanding that each window pays out exactly its own income, the verifier follows the undistributed balance from window to window:
+
+- carry_out = carry_in + owed - paid_out (carry_in is the previous cycle's carry_out).
+- carry_out below -`CARRY_DUST_LUNA` (default 10,000 = 0.1 NIM): more was paid out than was ever earned. MISMATCH ("payout exceeds rewards earned plus carried balance"); the carry restarts at 0.
+- carry_out above `CARRY_MAX_BATCHES` x the largest of the last 10 coinbases + `CARRY_DUST_LUNA` (default 1 batch): rewards are being withheld. MISMATCH ("rewards withheld ... (possible skim)"). A skim that stays perfectly proportional cannot hide: the carry grows every window until it crosses the limit, and it stays flagged until the money is paid out.
+- `CARRY_MAX_BATCHES=0` restores the strict rule: every window must pay out its own income.
+- The very first cycle has no baseline (the wallet may hold income earned before tracking began). A shortfall there establishes the baseline instead of failing (note "carry baseline established").
+- Fees: with `OPERATOR_ADDRS` set, the operator's entitlement (fee plus, in `total` mode, the deposit slice) is carried the same way, and a withdrawal beyond it fails ("operator withdrew more than its fee entitlement").
+
+The carry of every cycle is stored (`cycles.carry_luna`, `cycles.fee_carry_luna`) so anyone can re-add the chain.
+
+#### Check 2: each staker's share of what was paid
+
+- weights = each staker's active balance at window open (the validator's own deposit is not a staker).
+- D = what the stakers present at open received in the window. Stakers whose share floors below `MIN_SHARE_LUNA` and who got nothing (skipped dust) and stakers who unstaked mid-window leave the weight set.
+- pot = D, unless the median of the shares that can be measured precisely (>= 10,000 luna) implies a pot more than `DUST_TOLERANCE_LUNA` away from D. Then the median pot is used, so that one shorted staker is the one flagged rather than everyone else.
+- expected_i = floor(weight_i x pot / sum of weights).
+
+A line is OK when actual_i equals expected_i within 1 luna (integer flooring), or exceeds it by at most `DUST_TOLERANCE_LUNA` (500), or falls short by at most `SHARE_TOLERANCE_PPM` (10 parts per million of the share: the bot's live staker view lags the snapshots by a few lunas), or expected_i is below `MIN_SHARE_LUNA` and actual_i is 0. Otherwise it fails with "paid less than stake share of this payout" or "credit exceeds expected share". A payee with no opening balance (joined during the window) gets its own failing line.
+
+A drift check runs on top: the attributed credits plus any unattributed value must equal everything that left the wallet within 1 luna ("unaccounted restake value").
 
 Status:
 
-- VERIFIED: every line OK and neither cycle check fires.
+- VERIFIED: every line OK and no cycle check fires.
 - MISMATCH: anything else. Per-line expected and actual are stored in `cycle_shares` with a reason.
-- SKIPPED: the window cannot be judged. Either it is shorter than one reward interval (60 blocks) yet contains payouts (its funding income sits in the neighbouring window), or, in delta mode only, a staker has no balance snapshot inside the window and none can arrive any more. SKIPPED cycles carry a note, credit nothing and are never counted as verified.
+- SKIPPED: the window cannot be judged. Either it is shorter than one reward interval (60 blocks), has no income, and the carried balance cannot fund its payouts, or, in delta mode only, a staker has no balance snapshot inside the window and none can arrive any more. SKIPPED cycles carry a note, credit nothing and are never counted as verified.
 
-Reading a MISMATCH: the reference bot pays about one minute after rewards land, so a window boundary can fall between a reward and the payout it funds. That shows up as two neighbouring cycles that each miss by about one payout and reconcile as a pair. It is flagged, never hidden; the per-line data lets anyone check the pair.
-
-G1 is the ledger: every OK staker line from a closed cycle is credited into `staker_rewards`, one row per staker per cycle, carrying the staker's own AddStake tx hash.
+G1 is the ledger: every OK staker line from a closed cycle is credited into `staker_rewards`, one row per staker per cycle, carrying the staker's own payout tx hash.
 
 ### Worked example
 
-A window earns one coinbase of 2,000,000 lunas (20 NIM); held = 0, so available = 2,000,000.
+At window open three stakers hold A 40,000,000, B 30,000,000 and C 30,000,000 lunas (weights sum 100,000,000). The previous cycle closed with carry 0.
 
-At window open three stakers hold:
+Window 1 earns two coinbases of 2,000,000 lunas (owed 4,000,000), but the bot's sweep ran before the second one landed, so it pays 800,000 / 600,000 / 600,000 (paid_out 2,000,000).
 
-- A: 40,000,000 lunas (400 NIM)
-- B: 30,000,000 lunas (300 NIM)
-- C: 30,000,000 lunas (300 NIM)
+- carry_out = 0 + 4,000,000 - 2,000,000 = 2,000,000: one batch, inside the limit (2,000,000 + 10,000).
+- D = 2,000,000; expected = 800,000 / 600,000 / 600,000. Every line OK: VERIFIED.
 
-denominator = 100,000,000 lunas.
+Window 2 earns one coinbase (owed 2,000,000) and pays 1,600,000 / 1,200,000 / 1,200,000 (paid_out 4,000,000).
 
-- expected_A = floor(40,000,000 * 2,000,000 / 100,000,000) = 800,000 lunas (8 NIM)
-- expected_B = floor(30,000,000 * 2,000,000 / 100,000,000) = 600,000 lunas (6 NIM)
-- expected_C = 600,000 lunas (6 NIM)
+- carry_out = 2,000,000 + 2,000,000 - 4,000,000 = 0. VERIFIED. (Under a per-window rule both windows would have failed.)
 
-If the closing batch contains AddStake txs naming A, B and C for exactly 800,000, 600,000 and 600,000 lunas, every line is OK, the batch total equals the income, and the cycle is VERIFIED. If B received 590,000, B's line fails (underpaid by 10,000) and so does the skim check (the batch is 10,000 short of the income): MISMATCH.
+If in window 2 B had received 1,190,000: the median pot stays 4,000,000, so A and C are OK and B's line fails (10,000 short): MISMATCH. If instead the bot kept paying everyone 90% of each coinbase, every line would stay proportional, but the carry would grow by 200,000 per window and cross the limit after about ten windows: MISMATCH from then on, until the withheld rewards are paid.
 
 ### Scope and limits
 
-- Built for validators that pay stakers by restaking (AddStake) in proportion to stake, as the open-source ImpactZero restake bot does. A percentage fee (`VALIDATOR_FEE_PPM`) and a deposit-retaining split (`DENOMINATOR_MODE=total`) are supported; other rules (minimum payouts, tiered fees, payout by plain transfer) are not supported yet.
+- Built for validators that pay stakers in proportion to stake, by restaking (AddStake) like the open-source ImpactZero restake bot or by plain transfer (`PAYOUT_MODE`). A percentage fee (`VALIDATOR_FEE_PPM`, with fee withdrawals to `OPERATOR_ADDRS`) and a deposit-retaining split (`DENOMINATOR_MODE=total`) are supported. Other rules (minimum payout amounts, tiered fees, time-weighted shares within a payout period) are not supported yet.
+- Pools that pay less often than every batch (for example daily) need `CARRY_MAX_BATCHES` set to the batches in their payout period (1,440 per day).
 - Staker balances come from `STAKERS_URL_TEMPLATE` (keyed on the validator address). The default is the reference operator's API mirror; point it at any source you trust.
 - A staker who vanishes from the staker list is recorded as fully unstaked only when the list is complete (at least as many rows as the validator record's staker count), so a truncated answer never books a fake unstake.
 
@@ -103,7 +113,12 @@ Listed with their defaults. Thresholds mirror the ImpactZero restake bot.
 - REWARD_ADDR: the reward wallet that receives coinbases and sends restakes. Default: same as VALIDATOR_ADDR
 - MIN_TRIGGER_LUNA: the bot's restake trigger threshold, informational. Default: 2000
 - MIN_SHARE_LUNA: shares below this with no payout are OK. Default: 500
-- DUST_TOLERANCE_LUNA: allowed overpayment per line and allowed batch-vs-income difference. Default: 500
+- DUST_TOLERANCE_LUNA: allowed overpayment per staker line, and the median-pot switch threshold. Default: 500
+- CARRY_MAX_BATCHES: largest undistributed balance allowed, in batches of income (0 = every window pays its own income). Default: 1
+- CARRY_DUST_LUNA: slack on both sides of the carried balance. Default: 10000
+- SHARE_TOLERANCE_PPM: allowed shortfall per staker line, in parts per million of the share. Default: 10
+- PAYOUT_MODE: `restake`, `transfer` or `any`: which outbound payments count as staker payouts. Default: restake
+- OPERATOR_ADDRS: comma-separated operator wallets; outbound to them is a fee withdrawal checked against the fee rule. Default: empty
 - RESERVE_LUNA: the bot's wallet floor, recorded for reference, never deducted. Default: 0
 - BATCH_GAP_BLOCKS: a larger block gap between payout txs starts a new batch. Default: 10
 - MAX_CLOSE_PER_TICK: cycles closed per poll when catching up a backlog. Default: 600
@@ -131,7 +146,7 @@ All GET, all read-only, all JSON. Errors are returned as {"error": "..."}: 404 f
 ## Tools
 
 - tools/register_ingest_gaps.py --db PATH [--dry-run]: finds holes in the stored reward history and registers them for the ingest job to backfill.
-- tools/epoch_stats.py: host-side epoch production counter for the reference deployment (reads block producers through the operator's own node).
+- tools/epoch_stats.py: host-side epoch production counter for the reference deployment. It reads block producers through the operator's own node; `--rpc-cmd` sets how curl reaches the node. Every run continues the current epoch and finishes incomplete closed epochs within a batch budget.
 
 ## Development
 

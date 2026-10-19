@@ -265,6 +265,9 @@ class TxAttributionTest(unittest.TestCase):
     # MISMATCH (Guard 4b) in tx mode.
     def test_skim_mismatch_in_tx_mode(self):
         fake, db, cfg, jobs = base_env()
+        # M1: one short window is carry under the default limit; the strict
+        # limit (0 batches) keeps this a single-window skim test.
+        cfg.carry_max_batches = 0
         try:
             skim_batch_total = 1900000  # 95% of 2,000,000
             s_a = (40000000 * skim_batch_total) // TOTAL_LUNA

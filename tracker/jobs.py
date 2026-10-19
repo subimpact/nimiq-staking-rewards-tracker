@@ -536,44 +536,89 @@ class Jobs:
 
     def _verify_and_close(self, pending, closed_block, window, boundary=None,
                           close_bound_ms=None):
+        validator = self.cfg.validator_addr
         opened_block = int(pending["opened_block"])
-        rewards = self.db.rewards_in_window(
-            self.cfg.validator_addr, opened_block, closed_block
-        )
+        rewards = self.db.rewards_in_window(validator, opened_block, closed_block)
         # available = full coinbase sum in the window. reserve_luna is a wallet
-        # safety floor, NOT a per-cycle deduction from what the bot distributes:
-        # the bot pays out the whole reward (plus/minus dust), so carving the
-        # reserve here would make every expected share lower than actual and
-        # trip guard 5 for every staker. held stays as-is (0 in practice).
+        # safety floor, NOT a per-cycle deduction from what the bot distributes.
+        # held stays as-is (0 in practice: the mis-send sentinel).
         sum_rewards = _sum_ints(r["amount_luna"] for r in rewards)
         available = sum_rewards
         held = int(pending["held_luna"])
         available -= held
         if available < 0:
             available = 0
+        span = closed_block - opened_block
+        dust = int(getattr(self.cfg, "carry_dust_luna", 10000))
 
-        # Restake total in the window (also used by guard 4a below).
-        sum_txs = _sum_ints(r["amount_luna"] for r in window)
+        # ---- carry-in (M1) -------------------------------------------------
+        # The payout engine sweeps its wallet ~1 minute after a coinbase, so a
+        # cycle boundary regularly sits between a reward and the payout that
+        # distributes it. The verifier follows the undistributed balance from
+        # cycle to cycle instead of demanding that every window pays out
+        # exactly its own income. A predecessor closed before M1 (NULL carry)
+        # or no predecessor at all means the baseline is unknown.
+        prev = self.db.latest_closed_cycle_any(validator)
+        carry_in = None
+        fee_carry_in = 0
+        if prev is not None and prev["id"] != pending["id"]:
+            carry_in = prev["carry_luna"]
+            if prev["fee_carry_luna"] is not None:
+                fee_carry_in = int(prev["fee_carry_luna"])
+        baseline_known = carry_in is not None
+        carry_in = int(carry_in or 0)
+
+        # ---- classify every outbound row of the window (M2) ----------------
+        operator_norm = {_norm_addr(a) for a in getattr(self.cfg, "operator_addrs", [])}
+        contract_norm = _norm_addr(STAKING_CONTRACT_ADDR)
+        payout_mode = getattr(self.cfg, "payout_mode", "restake")
+        payout_rows = []
+        stray_rows = []
+        fee_paid = 0
+        for r in window:
+            to_norm = _norm_addr(r["to_addr"])
+            if to_norm and to_norm in operator_norm:
+                fee_paid += int(r["amount_luna"])
+                continue
+            is_restake = to_norm == contract_norm
+            if payout_mode == "any":
+                allowed = True
+            elif payout_mode == "transfer":
+                allowed = not is_restake
+            else:
+                allowed = is_restake
+            (payout_rows if allowed else stray_rows).append(r)
+
+        def _staker_of(r):
+            # Restakes name the staker via relatedAddresses; a plain transfer
+            # pays the staker's own address directly.
+            saddr = r["staker_address"]
+            if saddr and saddr.strip():
+                return saddr
+            if _norm_addr(r["to_addr"]) != contract_norm:
+                return r["to_addr"] or ""
+            return ""
+
+        sum_payout = _sum_ints(r["amount_luna"] for r in payout_rows)
+        sum_stray = _sum_ints(r["amount_luna"] for r in stray_rows)
+        paid_out = sum_payout + sum_stray        # left the wallet, not as fee
 
         # Degenerate-window guard: a coinbase lands every 60 blocks, so a
-        # window shorter than that can never contain the income that funds its
-        # payouts. When the cycle opener lands mid-burst (the bot spreads one
-        # distribution across 1-2 blocks a second apart), the window collapses
-        # to a block or two: payouts appear, but their funding coinbase sits in
-        # the adjacent window, so expected is 0 for every staker and Guard 5
-        # would MISMATCH every paid staker. There is nothing to verify: the
-        # restake txs remain on record in restake_txs for auditors, and the
-        # funding income is verified in its own window. Close SKIPPED.
-        # A window >= 60 blocks with payouts and no income is a real anomaly
-        # (operator paid with no earnings) and still goes MISMATCH.
-        span = closed_block - opened_block
-        if available == 0 and sum_txs > 0 and span < 60:
+        # window shorter than that can never contain the income funding its
+        # payouts. Under M1 the carried balance can fund them; only when it
+        # cannot (no baseline yet, or the carry does not cover the payout) is
+        # there nothing to verify: close SKIPPED. A window >= 60 blocks with
+        # payouts and no income is judged normally (carry or anomaly).
+        if available == 0 and paid_out > 0 and span < 60 and (
+                not baseline_known or carry_in - paid_out < -dust):
             self.db.clear_cycle_shares(pending["id"])
             self.db.close_cycle(
                 pending["id"], closed_block, self._now_ms(),
                 available, held, "SKIPPED",
                 attribution="",
                 note="degenerate window: payouts without income in a sub-60-block slice",
+                carry_luna=max(carry_in - paid_out, 0) if baseline_known else None,
+                fee_carry_luna=fee_carry_in - fee_paid,
             )
             self._open_pending_cycle()
             return
@@ -581,17 +626,18 @@ class Jobs:
         paid = {}
         paid_raw_addr = {}
         unmapped = []
-        for r in window:
-            saddr = r["staker_address"]
+        staker_hash_map = {}
+        for r in payout_rows:
+            saddr = _staker_of(r)
             if saddr and saddr.strip():
                 norm = _norm_addr(saddr)
                 paid[norm] = paid.get(norm, 0) + int(r["amount_luna"])
-                if norm not in paid_raw_addr:
-                    paid_raw_addr[norm] = saddr
+                paid_raw_addr.setdefault(norm, saddr)
+                staker_hash_map[norm] = r["tx_hash"]
             else:
                 unmapped.append(r)
 
-        mode = "tx" if (not unmapped and window) else "delta"
+        mode = "tx" if not unmapped else "delta"
 
         total = int(pending["total_luna"]) or 1
         opened_at_ms = int(pending["opened_at_ms"])
@@ -599,11 +645,7 @@ class Jobs:
         # cycle that hard-blocked for days carries a wall-clock opened_at_ms
         # older than its closing batch, so "first snapshot strictly after"
         # would resolve to a pre-payout poll and mis-attribute the window.
-        # Anchoring at the first restake tx strictly after the opener block
-        # gives the identical chain-time semantics new cycles already get.
-        reanchored = self.db.first_restake_ts_after(
-            self.cfg.validator_addr, opened_block
-        )
+        reanchored = self.db.first_restake_ts_after(validator, opened_block)
         if reanchored is not None and reanchored > opened_at_ms:
             opened_at_ms = reanchored
         boundary_hash = ""
@@ -611,46 +653,30 @@ class Jobs:
             boundary_hash = boundary[-1]["tx_hash"]
         else:
             b = self.db.next_restake_batch(
-                self.cfg.validator_addr, opened_block, self.cfg.batch_gap_blocks
+                validator, opened_block, self.cfg.batch_gap_blocks
             )
             if b is not None:
                 boundary_hash = b[1][-1]["tx_hash"]
 
-        staker_hash_map = {}
-        for r in window:
-            if r["staker_address"]:
-                staker_hash_map[_norm_addr(r["staker_address"])] = r["tx_hash"]
-
-        # Option A attribution: active balances only change via AddStake, so a
-        # staker's credit is the active-balance delta between the snapshot
-        # at/before the window opened and the first snapshot strictly after.
-        # Balance lookups are memoized per (addr) per window: the exclusion
-        # scan, Guard 1, the delta loop, staker_sum and the expected loop all
-        # read the same two values, and at 3+ stakers x hundreds of closes per
-        # tick the redundant queries dominate drain latency.
+        # Opening balances weight each staker's share; in delta mode the
+        # close-side balances also measure the credit. Lookups memoized per
+        # address per window (drain latency).
         open_bal_map = {}
         close_bal_map = {}
-        open_addrs = self.db.staker_addresses_at(self.cfg.validator_addr, opened_at_ms)
+        open_addrs = self.db.staker_addresses_at(validator, opened_at_ms)
         close_addrs = self.db.staker_addresses_after(
-            self.cfg.validator_addr, opened_at_ms, close_bound_ms
+            validator, opened_at_ms, close_bound_ms
         )
 
-        # A staker whose balance was already 0 at the cycle open and whose last
-        # snapshot IS that open (never snapshotted again afterwards) has fully
-        # unstaked and left the staker list: the snapshot job stops fetching
-        # them, so a "strictly after" snapshot can never exist. Blocking the
-        # close on them wedges every later cycle (12-day outage root cause,
-        # 2026-09-18..09-30). They hold no stake and expect no share; drop them
-        # from the attribution set instead. A staker with a NONZERO balance at
-        # open whose snapshots genuinely stopped still blocks the close: that
-        # is real insufficient data and must stay PENDING.
+        # A staker whose balance was already 0 at open and who was never
+        # snapshotted again has fully unstaked and left the staker list; drop
+        # them instead of wedging the close (2026-09-18..09-30 outage). A
+        # NONZERO staker whose snapshots stopped still blocks (delta mode).
         excluded = set()
         for addr in sorted(open_addrs):
-            bal_at = self.db.staker_balance_at(
-                self.cfg.validator_addr, addr, opened_at_ms
-            )
+            bal_at = self.db.staker_balance_at(validator, addr, opened_at_ms)
             bal_after = self.db.staker_balance_after(
-                self.cfg.validator_addr, addr, opened_at_ms, close_bound_ms
+                validator, addr, opened_at_ms, close_bound_ms
             )
             open_bal_map[addr] = bal_at
             if bal_after is not None:
@@ -659,133 +685,145 @@ class Jobs:
                 excluded.add(addr)
         open_addrs -= excluded
 
+        # ---- what the rule says stakers are owed from this window's income --
+        # Denominator = sum of staker balances at open (the reference bot
+        # redistributes the deposit's earned slice). VALIDATOR_FEE_PPM takes
+        # the operator's cut; DENOMINATOR_MODE=total keeps the deposit slice
+        # with the operator. Falls back to the validator total when no
+        # staker snapshots exist.
+        staker_sum = sum((open_bal_map.get(a) or 0) for a in open_addrs)
+        denom = staker_sum if staker_sum > 0 else total
+        fee_ppm = int(getattr(self.cfg, "validator_fee_ppm", 0) or 0)
+        fee_cut = (available * fee_ppm) // 1000000
+        if (getattr(self.cfg, "denominator_mode", "stakers") == "total"
+                and total > staker_sum > 0):
+            denom = total
+        owed = available - fee_cut
+        if denom != staker_sum and staker_sum > 0:
+            owed = (owed * staker_sum) // denom
+        operator_take = available - owed
+
+        carry_out = carry_in + owed - paid_out
+        fee_carry_out = fee_carry_in + operator_take - fee_paid
+
+        def _close_skipped(note):
+            self.db.clear_cycle_shares(pending["id"])
+            self.db.close_cycle(
+                pending["id"], closed_block, self._now_ms(),
+                available, held, "SKIPPED", attribution="delta", note=note,
+                carry_luna=(carry_out if carry_out >= -dust else 0)
+                if baseline_known else None,
+                fee_carry_luna=fee_carry_out,
+            )
+            self._open_pending_cycle()
+
         unaccounted = 0
         reason_map = {}
         actual_map = {}
         non_open_payees = []
 
         if mode == "tx":
+            # Actuals are the payout txs that name each staker; snapshots
+            # only weight the expected share.
             open_norm = {_norm_addr(a) for a in open_addrs}
             for addr in sorted(open_addrs):
-                norm = _norm_addr(addr)
-                actual_map[addr] = paid.get(norm, 0)
+                actual_map[addr] = paid.get(_norm_addr(addr), 0)
                 open_bal = open_bal_map.get(addr) or 0
                 close_bal = close_bal_map.get(addr)
                 if close_bal is not None and (close_bal - open_bal < 0):
                     reason_map[addr] = "unstaked during cycle"
-
             for norm in sorted(paid.keys()):
                 if norm not in open_norm:
-                    amt = paid[norm]
-                    non_open_payees.append((norm, amt))
-                    unaccounted += amt
+                    non_open_payees.append((norm, paid[norm]))
+                    unaccounted += paid[norm]
         else:
-            # Mode "delta"
-            # Guard 1: every remaining staker present at open needs a snapshot
-            # strictly after the cycle opened; otherwise the window cannot be
-            # attributed. When close_bound_ms is not None, a later batch exists
-            # so the snapshot can never arrive; close SKIPPED.
+            # Delta mode: some payout rows do not name their staker, so the
+            # credit is the active-balance delta across the window.
+            # Guard 1: every remaining staker present at open needs a
+            # snapshot strictly after the open. With a later batch on record
+            # (close_bound_ms set) it can never arrive: close SKIPPED.
             for addr in sorted(open_addrs):
-                if self.db.staker_balance_after(
-                    self.cfg.validator_addr, addr, opened_at_ms, close_bound_ms
-                ) is None:
+                if addr not in close_bal_map:
                     if close_bound_ms is not None:
-                        self.db.clear_cycle_shares(pending["id"])
-                        self.db.close_cycle(
-                            pending["id"], closed_block, self._now_ms(),
-                            available, held, "SKIPPED",
-                            attribution="delta",
-                            note="insufficient snapshot coverage",
-                        )
-                        self._open_pending_cycle()
+                        _close_skipped("insufficient snapshot coverage")
                         return
-                    # Insufficient snapshots; leave the cycle PENDING.
-                    return
-
+                    return        # wait for the snapshot (stays PENDING)
             for addr in sorted(open_addrs):
-                open_bal = open_bal_map.get(addr) or 0
-                close_bal = close_bal_map.get(addr)
-                if close_bal is None:
-                    close_bal = self.db.staker_balance_after(
-                        self.cfg.validator_addr, addr, opened_at_ms, close_bound_ms
-                    )
-                    if close_bal is None:
-                        if close_bound_ms is not None:
-                            self.db.clear_cycle_shares(pending["id"])
-                            self.db.close_cycle(
-                                pending["id"], closed_block, self._now_ms(),
-                                available, held, "SKIPPED",
-                                attribution="delta",
-                                note="insufficient snapshot coverage",
-                            )
-                            self._open_pending_cycle()
-                            return
-                        return
-                    close_bal_map[addr] = close_bal
-                delta = close_bal - open_bal
+                delta = close_bal_map[addr] - (open_bal_map.get(addr) or 0)
                 actual_map[addr] = delta
                 if delta < 0:
                     # Guard 2: active balance decreased (unstake).
                     unaccounted += -delta
                     reason_map[addr] = "unstaked during cycle"
-
-            # Guard 3: new stakers that appear mid-cycle have no open balance and
-            # cannot be attributed; count their window credit as unaccounted.
+            # Guard 3: new stakers that appear mid-cycle cannot be
+            # attributed; count their window credit as unaccounted.
             for addr in close_addrs - open_addrs:
                 close_bal = self.db.staker_balance_after(
-                    self.cfg.validator_addr, addr, opened_at_ms, close_bound_ms
+                    validator, addr, opened_at_ms, close_bound_ms
                 )
                 unaccounted += close_bal or 0
 
+        # ---- per-staker check: share of what was actually paid out ---------
+        # expected_i = balance_i * D / S over the stakers present at open,
+        # D = what those stakers received in this window. Stakers whose share
+        # floors below MIN_SHARE and who got nothing are the payout engine's
+        # skipped dust: they leave the weight set. Whether D itself is the
+        # right total is the carry check's job below.
+        # Stakers already failed by a hard reason (unstaked mid-window) leave
+        # the weight set together with whatever they received.
+        weighted = {a for a in open_addrs if a not in reason_map}
+        weights = {a: (open_bal_map.get(a) or 0) for a in weighted}
+        D = sum(max(actual_map[a], 0) for a in weighted)
+        S = sum(weights.values())
+        min_share = self.cfg.min_share_luna
+        skipped = {
+            a for a in weighted
+            if actual_map[a] == 0 and (S <= 0 or (weights[a] * D) // S < min_share)
+        }
+        S_eff = S - sum(weights[a] for a in skipped)
+        # Pot = the amount the split is judged against. Normally D itself
+        # (exact proportionality of what was paid). When one or a few stakers
+        # are off, D is pulled by them and would blame everyone else, so the
+        # pot follows the MEDIAN implied pot of the precisely measurable
+        # shares (>= 10,000 luna) whenever it differs from D by more than
+        # the dust tolerance: the outliers are then the ones flagged.
+        pot = D
+        if S_eff > 0:
+            implied = sorted(
+                (actual_map[a] * S_eff) // weights[a]
+                for a in weighted
+                if a not in skipped and weights[a] > 0
+                and (weights[a] * D) // S_eff >= 10000 and actual_map[a] > 0
+            )
+            if len(implied) >= 3:
+                mid = len(implied) // 2
+                med = (implied[mid] if len(implied) % 2
+                       else (implied[mid - 1] + implied[mid]) // 2)
+                if abs(med - D) > self.cfg.dust_tolerance_luna:
+                    pot = med
+        ppm = int(getattr(self.cfg, "share_tolerance_ppm", 10))
+
         all_ok = True
         sum_delta = 0
-        expected_total = 0
-        # Denominator = sum of staker ledger balances at cycle open, matching
-        # what the payout engine actually distributes against (its validator
-        # balance excludes the 100k deposit, so the deposit's earned slice is
-        # redistributed to stakers; the verifier must expect that). Falls back
-        # to the validator total when no staker snapshots exist.
-        staker_sum = sum(
-            (open_bal_map.get(a) or 0)
-            for a in open_addrs
-        )
-        denom = staker_sum if staker_sum > 0 else total
-        # Distribution rule knobs (defaults = the reference bot: 0% fee,
-        # deposit slice redistributed). VALIDATOR_FEE_PPM takes the
-        # operator's cut off the window income; DENOMINATOR_MODE=total keeps
-        # the deposit's slice with the operator (denominator = validator
-        # total at open, deposit included).
-        fee_ppm = int(getattr(self.cfg, "validator_fee_ppm", 0) or 0)
-        fee_cut = (available * fee_ppm) // 1000000
-        distributable = available - fee_cut
-        if (getattr(self.cfg, "denominator_mode", "stakers") == "total"
-                and total > staker_sum > 0):
-            denom = total
-        payout_target = sum_rewards - fee_cut
-        if denom != staker_sum and staker_sum > 0:
-            payout_target = (payout_target * staker_sum) // denom
         for addr in sorted(open_addrs):
-            balance = open_bal_map.get(addr) or 0
-            expected = (balance * distributable) // denom
-            expected_total += expected
+            expected = 0
+            if addr in weighted and addr not in skipped and S_eff > 0:
+                expected = (weights[addr] * pot) // S_eff
             actual = actual_map[addr]
             sum_delta += actual
-
             if addr in reason_map:
                 ok = False
                 reason = reason_map[addr]
             elif actual > expected + self.cfg.dust_tolerance_luna:
-                # Guard 5: credit exceeds expected share by more than the dust
-                # noise floor. The bot pays every staker's proportional share
-                # each cycle (integer floor; only zero shares are skipped), and
-                # its live staker view lags our minute-snapshots by a few lunas,
-                # so a small overage is normal operating behavior. Anything
-                # beyond the tolerance is an external top-up or misallocation.
                 ok = False
                 reason = "credit exceeds expected share (possible external top-up)"
-            else:
-                ok = _is_ok(expected, actual, self.cfg.min_share_luna, self.cfg.dust_tolerance_luna)
+            elif _is_ok(expected, actual, min_share,
+                        self.cfg.dust_tolerance_luna, ppm):
+                ok = True
                 reason = ""
+            else:
+                ok = False
+                reason = "paid less than stake share of this payout"
             all_ok = all_ok and ok
             self.db.upsert_cycle_share(
                 pending["id"], addr, expected, actual,
@@ -795,26 +833,56 @@ class Jobs:
 
         if mode == "tx":
             for norm, amt in non_open_payees:
-                payee_addr = paid_raw_addr.get(norm, norm)
                 all_ok = False
                 self.db.upsert_cycle_share(
-                    pending["id"], payee_addr, 0, amt,
+                    pending["id"], paid_raw_addr.get(norm, norm), 0, amt,
                     staker_hash_map.get(norm) or boundary_hash,
                     0, "payee had no opening balance (joined during cycle)",
                 )
+        for r in stray_rows:
+            # Money left the reward wallet outside the payout rule (e.g. a
+            # plain transfer from a restake pool): never a verified payout.
+            all_ok = False
+            unaccounted += int(r["amount_luna"])
+            self.db.upsert_cycle_share(
+                pending["id"], r["to_addr"] or "?", 0, int(r["amount_luna"]),
+                r["tx_hash"], 0,
+                "outbound payment outside PAYOUT_MODE=%s" % payout_mode,
+            )
 
-        # Guard 4a: internal consistency of the attribution. The sum of on-chain
-        # restakes must match the sum of attributed deltas plus any unaccounted
-        # (restaked) value within 1 luna, else the window was mis-windowed.
-        drift = abs(sum_txs - (sum_delta + unaccounted)) > 1
+        # Guard 4a: internal consistency of the attribution. Everything that
+        # left the wallet (besides operator fee withdrawals) must equal the
+        # attributed credits plus the unaccounted value within 1 luna.
+        drift = abs(paid_out - (sum_delta + unaccounted)) > 1
 
-        # Guard 4b: honesty against the cycle's actual reward income. The bot
-        # distributes what it earns (within dust); if the batch sum is far from
-        # the coinbase sum in the same window, the operator is skimming while
-        # staying internally proportional.
-        skim = abs(sum_txs - payout_target) > self.cfg.dust_tolerance_luna
+        # Guard 4b (M1): the carried balance. Negative = more paid out than
+        # was ever earned (unexplained funds); above the limit = rewards
+        # withheld from stakers. With no baseline yet (first cycle, or the
+        # first after an upgrade) a negative carry establishes it instead.
+        carry_flag = ""
+        note = ""
+        carry_store = carry_out
+        if carry_out < -dust:
+            carry_store = 0
+            if baseline_known:
+                carry_flag = ("payout exceeds rewards earned plus carried "
+                              "balance (unexplained funds)")
+            else:
+                note = "carry baseline established"
+        else:
+            batches = int(getattr(self.cfg, "carry_max_batches", 1))
+            unit = self.db.max_recent_reward(validator, closed_block) or 0
+            if carry_out > batches * unit + dust:
+                carry_flag = ("rewards withheld: undistributed balance above "
+                              "%d batch(es) of income (possible skim)" % batches)
+        fee_flag = ""
+        fee_store = fee_carry_out
+        if operator_norm and fee_carry_out < -dust:
+            fee_store = 0
+            if baseline_known:
+                fee_flag = "operator withdrew more than its fee entitlement"
 
-        if drift or skim:
+        if drift or carry_flag or fee_flag:
             status = "MISMATCH"
         else:
             status = "VERIFIED" if all_ok else "MISMATCH"
@@ -822,20 +890,20 @@ class Jobs:
         closed_at_ms = self._now_ms()
         self.db.close_cycle(
             pending["id"], closed_block, closed_at_ms, available, held, status,
-            attribution=mode, note="",
+            attribution=mode, note=note, carry_luna=carry_store,
+            fee_carry_luna=fee_store,
         )
 
-        # Surface the drift/skim reasons on shares that have none yet.
-        if drift or skim:
-            if drift and skim:
-                reason = (
-                    "unaccounted restake value (possible timing drift); "
-                    "distribution does not match cycle rewards (possible skim)"
-                )
-            elif drift:
-                reason = "unaccounted restake value (possible timing drift)"
-            else:
-                reason = "distribution does not match cycle rewards (possible skim)"
+        # Surface the cycle-level reasons on shares that have none yet.
+        parts = []
+        if drift:
+            parts.append("unaccounted restake value (possible timing drift)")
+        if carry_flag:
+            parts.append(carry_flag)
+        if fee_flag:
+            parts.append(fee_flag)
+        if parts:
+            reason = "; ".join(parts)
             for share in self.db.cycle_shares(pending["id"]):
                 if share["reason"]:
                     continue
@@ -846,17 +914,14 @@ class Jobs:
                 )
 
         # G1 ledger (guard 7): credited amounts for ok stakers. tx_hash is the
-        # staker's real AddStake hash when the explorer named them in
-        # relatedAddresses; the boundary batch hash stands in only when the
-        # endpoint did not expose the mapping.
+        # staker's real payout hash when the explorer named them; the
+        # boundary batch hash stands in only when it did not.
         for share in self.db.cycle_shares(pending["id"]):
             if not share["ok"]:
                 continue
-            credited = int(share["actual_luna"])
             self.db.credit_staker_reward(
-                share["staker_address"], closed_block, credited,
-                share["tx_hash"], closed_at_ms,
-                validator=self.cfg.validator_addr,
+                share["staker_address"], closed_block, int(share["actual_luna"]),
+                share["tx_hash"], closed_at_ms, validator=validator,
             )
 
         self._open_pending_cycle()
@@ -916,13 +981,18 @@ def _is_coinbase(sender):
     return COINBASE_ADDR.replace(" ", "") in sender.replace(" ", "").upper()
 
 
-def _is_ok(expected, actual, min_share, dust_tolerance=500):
+def _is_ok(expected, actual, min_share, dust_tolerance=500, under_ppm=0):
     if actual == expected:
         return True
     if expected < min_share and actual == 0:
         return True
     # Integer-rounding tolerance (the bot floors each share).
     if abs(actual - expected) <= 1:
+        return True
+    # Relative under-drift tolerance (M1): the payout engine's live staker
+    # view lags the minute snapshots by a few lunas, which moves a large
+    # share by a few lunas. under_ppm parts per million of the share.
+    if actual < expected and expected - actual <= (expected * under_ppm) // 1000000:
         return True
     # Dust-noise floor: actual may exceed expected by up to one dust
     # tolerance because dust shares (< min_share) are skipped and swept into

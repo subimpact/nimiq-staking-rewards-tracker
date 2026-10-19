@@ -106,10 +106,13 @@ class DistributionRuleTest(unittest.TestCase):
             fake.close()
 
     def test_default_rule_flags_the_same_fee_payout(self):
-        # Same payout under the default 0% rule is a 10% underpayment.
+        # Same payout under the default 0% rule is a 10% underpayment. Since
+        # M1 a single short window is carry (paid next cycle) unless the
+        # carry limit is 0, so this one-window test runs the strict limit;
+        # tests/test_carry.py covers the default limit over many windows.
         fake = FakeServer()
         try:
-            cfg, db, jobs = _jobs(fake, 100000000)
+            cfg, db, jobs = _jobs(fake, 100000000, CARRY_MAX_BATCHES="0")
             _run_window(fake, jobs, [720000, 540000, 540000])
             self.assertEqual(closed_cycle(db)[0]["status"], "MISMATCH")
             db.close()
