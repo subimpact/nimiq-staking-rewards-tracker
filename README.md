@@ -161,4 +161,10 @@ The tests drive the real fetcher against local fake explorer and staker servers 
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Copyright (c) 2026 subimpact network.
+
+Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0-only). See [LICENSE](LICENSE).
+
+You can run, study, modify and share the tracker freely, including running it for your own validator or stakers. If you run a modified version as a network service, you must offer the source of your modified version to its users.
+
+Earlier releases, up to and including commit `31bb7a8`, were published under the MIT License and remain available under MIT. Everything after that commit is AGPL-3.0-only.
