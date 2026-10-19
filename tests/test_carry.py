@@ -177,6 +177,22 @@ class CarryTest(unittest.TestCase):
         self.assertNotIn(c["closed_block"], blocks(STAKER_C))
         self.assertIn(c["closed_block"], blocks(STAKER_A))
 
+    def test_overpaid_tiny_shares_do_not_fail_the_big_ones(self):
+        # Live shape of cycle 1352 (Sep 2026): tiny stakers got tens of lunas
+        # more than their few-luna share; folding that into the pot made the
+        # big stakers look ~58 luna short. They are exactly proportional.
+        tiny = ["NQ0%d TINY TINY TINY TINY TINY TINY TINY TINY" % i for i in (6, 7)]
+        h = self.h = Harness()
+        for t_ in tiny:
+            h.db.upsert_staker_snapshot(VALIDATOR, t_, 1, 3000000, 0)    # ~35 luna share
+        h.seed(0)
+        pay = split(COINBASE)
+        pay[tiny[0]] = 95
+        pay[tiny[1]] = 90
+        h.window([COINBASE], pay)
+        c = h.close_all()[0]
+        self.assertEqual(c["status"], "VERIFIED")
+
     def test_lagged_staker_view_within_ppm_tolerance(self):
         # The bot's live balances lag the snapshots: the largest share comes
         # in 5 luna low (10 ppm of ~650k = 6). Not an underpayment.
