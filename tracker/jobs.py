@@ -781,25 +781,34 @@ class Jobs:
             if actual_map[a] == 0 and (S <= 0 or (weights[a] * D) // S < min_share)
         }
         S_eff = S - sum(weights[a] for a in skipped)
-        # Pot = the amount the split is judged against. Normally D itself
-        # (exact proportionality of what was paid). When one or a few stakers
-        # are off, D is pulled by them and would blame everyone else, so the
-        # pot follows the MEDIAN implied pot of the precisely measurable
-        # shares (>= 10,000 luna) whenever it differs from D by more than
+        # Pot = the amount the split is judged against, measured on the
+        # shares that can be measured precisely (expected >= 10,000 luna):
+        # pot = their payouts scaled up by their weight. Tiny shares carry
+        # rounding and dust handling of tens of lunas that, folded into D,
+        # would be spread over every big share and fail them by a few dozen
+        # lunas (early-history finding, 2026-10-19). When one or a few of the
+        # precise stakers are themselves off, their sum is pulled too, so the
+        # pot follows the MEDIAN implied pot whenever it differs by more than
         # the dust tolerance: the outliers are then the ones flagged.
         pot = D
         if S_eff > 0:
+            precise = [
+                a for a in weighted
+                if a not in skipped and weights[a] > 0
+                and (weights[a] * D) // S_eff >= 10000
+            ]
+            w_precise = sum(weights[a] for a in precise)
+            if precise and w_precise > 0:
+                pot = (sum(max(actual_map[a], 0) for a in precise) * S_eff) // w_precise
             implied = sorted(
                 (actual_map[a] * S_eff) // weights[a]
-                for a in weighted
-                if a not in skipped and weights[a] > 0
-                and (weights[a] * D) // S_eff >= 10000 and actual_map[a] > 0
+                for a in precise if actual_map[a] > 0
             )
             if len(implied) >= 3:
                 mid = len(implied) // 2
                 med = (implied[mid] if len(implied) % 2
                        else (implied[mid - 1] + implied[mid]) // 2)
-                if abs(med - D) > self.cfg.dust_tolerance_luna:
+                if abs(med - pot) > self.cfg.dust_tolerance_luna:
                     pot = med
         ppm = int(getattr(self.cfg, "share_tolerance_ppm", 10))
 
