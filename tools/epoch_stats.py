@@ -15,14 +15,25 @@ Design notes:
 - Expected slots = (our stake / network total) * micro_total, computed from
   the staker ledger at epoch start; deviation is honest labeling only.
 
-Run on the VPS host (needs `docker exec nimiq` for RPC and write access to
-the tracker DB). Cron every 5 minutes is fine; closed epochs are counted once
-and cached, the current epoch only counts new batches since the last run.
+Run on the VPS host (needs node RPC access and write access to the tracker
+DB). Cron every 5 minutes is fine. Every run continues the CURRENT epoch from
+where the last run stopped, then spends the remaining batch budget finishing
+closed epochs that are not fully counted yet (newest first). A row's
+end_block is the last block actually counted, so a closed epoch is complete
+when end_block == start_block + 43,199. Blocks the node cannot serve (history
+too shallow) stop the walk for that epoch instead of being counted as zero.
+
+RPC transport: `--rpc-cmd` (or env NIMIQ_RPC_CMD) is the command prefix that
+runs curl next to the node, default `docker exec <--docker>`. On the
+ImpactZero VPS it is `/root/nimiq-curl` (curl inside the container's network
+namespace, no docker exec per call).
 """
 
 import argparse
+import fcntl
 import json
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -98,6 +109,12 @@ def find_epoch_start(target_epoch, lo, hi, docker):
     return hi
 
 
+def _readable(d):
+    """A block the node really served (shallow history answers with a stub
+    that has no type / epoch)."""
+    return bool(d) and d.get("type") in ("micro", "macro")
+
+
 def compact(addr):
     return (addr or "").replace(" ", "").upper()
 
@@ -107,10 +124,25 @@ def main():
     ap.add_argument("--db", default=os.environ.get("DATA_DIR", "/opt/nimiq-staking-rewards-tracker/data") + "/tracker.db")
     ap.add_argument("--validator", default="NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY")
     ap.add_argument("--docker", default="nimiq")
+    ap.add_argument("--rpc-cmd", default=os.environ.get("NIMIQ_RPC_CMD", ""),
+                    help="command prefix that runs curl next to the node "
+                         "(default: docker exec <--docker>)")
+    ap.add_argument("--max-batches", type=int, default=1500,
+                    help="batched RPC calls per run (one per 60-block batch)")
+    ap.add_argument("--lookback", type=int, default=3,
+                    help="closed epochs without any row to start counting")
     args = ap.parse_args()
 
-    docker = ["docker", "exec", args.docker]
+    docker = shlex.split(args.rpc_cmd) if args.rpc_cmd else ["docker", "exec", args.docker]
     ours = compact(args.validator)
+
+    # One run at a time: a long catch-up run must not overlap the next cron.
+    lock = open(args.db + ".epoch-stats.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("another epoch_stats run holds the lock; exiting")
+        return 0
 
     conn = sqlite3.connect(args.db, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -168,23 +200,35 @@ def main():
         print("WARNING boundary mismatch: expected epoch %s at %s, got %s"
               % (boundary_epoch, boundary, e))
 
-    # Which epochs to process: the current one, plus any closed ones that were
-    # never fully counted (have no epoch_stats row yet).
+    # Which epochs to process. The CURRENT epoch every run (2026-10-19 fix:
+    # the old "no row yet" test froze every epoch after its first run, so
+    # the panel showed ~200 of 43,200 blocks per epoch); then closed epochs
+    # whose row stops short of the epoch end, newest first; then closed
+    # epochs within --lookback that have no row at all.
     stats = {r["epoch"]: r for r in conn.execute(
         "SELECT * FROM epoch_stats WHERE validator=?", (args.validator,)
     ).fetchall()}
 
-    epochs_to_do = []
-    epoch_num = boundary_epoch
-    # Current epoch plus up to 3 closed epochs lacking a fully counted row.
-    for _ in range(4):
-        if epoch_num not in stats:
-            epochs_to_do.append(epoch_num)
-        epoch_num -= 1
-    epochs_to_do.reverse()
+    def _epoch_start(ep):
+        return boundary - (boundary_epoch - ep) * EPOCH_BLOCKS
+
+    incomplete = sorted(
+        (ep for ep, r in stats.items()
+         if ep < boundary_epoch
+         and int(r["end_block"] or 0) < _epoch_start(ep) + EPOCH_BLOCKS - 1),
+        reverse=True,
+    )
+    missing = [boundary_epoch - k for k in range(1, args.lookback + 1)
+               if (boundary_epoch - k) not in stats]
+    epochs_to_do = [boundary_epoch] + incomplete + [
+        ep for ep in missing if ep not in incomplete]
+    budget = {"left": args.max_batches}
 
     for ep in epochs_to_do:
-        ep_start = boundary - (boundary_epoch - ep) * EPOCH_BLOCKS
+        if budget["left"] <= 0:
+            print("batch budget spent; remaining epochs continue next run")
+            break
+        ep_start = _epoch_start(ep)
         if ep == boundary_epoch:
             ep_end = head
         else:
@@ -195,38 +239,62 @@ def main():
         micro_total = int(existing["micro_total"]) if existing else 0
         produced = int(existing["produced"]) if existing else 0
         walked_any = False
+        conn.commit()
         # Incremental: only walk blocks after the last counted one.
         upto_key = "epoch_stats_upto_%s" % ep
         upto_row = conn.execute(
             "SELECT v FROM meta WHERE k=?", (upto_key,)
         ).fetchone()
         walk_from = int(upto_row["v"]) + 1 if upto_row and upto_row["v"] is not None else ep_start
+        counted_to = walk_from - 1
 
         if walk_from <= ep_end:
-            # Walk batches in [walk_from, ep_end]; one batched RPC per batch.
-            batch_start = walk_from - (walk_from - ep_start) % BATCH_BLOCKS
-            if batch_start < walk_from:
-                batch_start += BATCH_BLOCKS
-            while batch_start <= ep_end:
-                heights = list(range(batch_start, min(batch_start + BATCH_BLOCKS, ep_end + 1)))
+            # Walk [walk_from, ep_end] one batched RPC (<= 60 heights) at a
+            # time. Heights continue exactly after the last counted block, so
+            # a resumed walk never double-counts or skips a block.
+            h0 = walk_from
+            while h0 <= ep_end and budget["left"] > 0:
+                batch_end = min(ep_start + ((h0 - ep_start) // BATCH_BLOCKS + 1) * BATCH_BLOCKS - 1, ep_end)
+                heights = list(range(h0, batch_end + 1))
                 blocks = batch_blocks(heights, docker)
+                budget["left"] -= 1
+                got = [h for h in heights if _readable(blocks.get(h))]
+                if len(got) != len(heights):
+                    # Node cannot serve part of this range (history too
+                    # shallow, or an RPC hiccup): count nothing past the
+                    # contiguous readable prefix; retry next run.
+                    prefix = []
+                    for h in heights:
+                        if not _readable(blocks.get(h)):
+                            break
+                        prefix.append(h)
+                    heights = prefix
                 for h in heights:
-                    d = blocks.get(h)
-                    if d:
-                        walked_any = True
-                    if d and d.get("type") == "micro":
+                    d = blocks[h]
+                    walked_any = True
+                    if d.get("type") == "micro":
                         micro_total += 1
                         p = d.get("producer")
                         prod = p.get("validator", "") if isinstance(p, dict) else (p or "")
                         if compact(prod) == ours:
                             produced += 1
-                batch_start += BATCH_BLOCKS
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(k, v) VALUES(?, ?)",
-                (upto_key, str(ep_end)),
-            )
+                    counted_to = h
+                if len(heights) != batch_end - h0 + 1:
+                    break
+                h0 = batch_end + 1
+            if h0 <= ep_end and budget["left"] <= 0:
+                print("batch budget spent at block %s; epoch %s continues next run"
+                      % (counted_to, ep))
+            if counted_to >= walk_from:
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(k, v) VALUES(?, ?)",
+                    (upto_key, str(counted_to)),
+                )
+        ep_end = max(counted_to, ep_start - 1)
+        if existing is not None and existing["end_block"] is not None:
+            ep_end = max(ep_end, int(existing["end_block"]))
 
-        if existing is None and micro_total == 0 and not walked_any:
+        if existing is None and not walked_any:
             # Node history does not reach this epoch; do not record a bogus
             # "0 produced" row that the UI would display as fact.
             print("epoch %s: no readable blocks (node history too shallow), skipping"

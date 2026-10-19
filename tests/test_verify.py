@@ -424,9 +424,11 @@ class VerifyTest(unittest.TestCase):
             # Per-staker all ok; the drift surfaces on the shares' reason.
             shares = db.cycle_shares(cycle["id"])
             self.assertTrue(all(s["ok"] == 1 for s in shares))
+            # M1: the 10,000-luna overpay sits inside CARRY_DUST_LUNA, so
+            # only the drift reason fires (the old per-window skim check also
+            # fired here).
             self.assertTrue(all(
-                s["reason"]
-                == "unaccounted restake value (possible timing drift); distribution does not match cycle rewards (possible skim)"
+                s["reason"] == "unaccounted restake value (possible timing drift)"
                 for s in shares
             ))
         finally:
@@ -463,11 +465,17 @@ class VerifyTest(unittest.TestCase):
             cycles = closed_cycle(db)
             cycle = cycles[0]
             self.assertEqual(cycle["status"], "MISMATCH")
-            shares = db.cycle_shares(cycle["id"])
-            self.assertTrue(all(
-                s["reason"] == "unaccounted restake value (possible timing drift)"
-                for s in shares
-            ))
+            shares = {s["staker_address"]: s for s in db.cycle_shares(cycle["id"])}
+            # M1: C (100 luna short) carries its own underpayment reason; the
+            # others carry the cycle-level drift reason.
+            self.assertEqual(
+                shares[STAKER_C]["reason"], "paid less than stake share of this payout"
+            )
+            for addr in (STAKER_A, STAKER_B):
+                self.assertEqual(
+                    shares[addr]["reason"],
+                    "unaccounted restake value (possible timing drift)",
+                )
         finally:
             db.close()
             fake.close()
@@ -476,9 +484,12 @@ class VerifyTest(unittest.TestCase):
     def test_skim_detected(self):
         # The bot distributes only 1,700,000 of a 2,000,000 coinbase, but the
         # batch deltas match that batch proportionally (all stakers internally
-        # consistent). Guard 4a (drift) passes; guard 4b (honesty vs the cycle's
-        # reward income) fires -> MISMATCH with the skim reason on every share.
+        # consistent). Guard 4a (drift) passes; guard 4b (the carried balance)
+        # fires -> MISMATCH with the skim reason on every share. M1: with the
+        # default limit one short window is carry, so this single-window test
+        # runs the strict limit (0 batches); see tests/test_carry.py.
         fake, db, cfg, jobs = base_env()
+        cfg.carry_max_batches = 0
         try:
             skim_batch_total = 1700000
             s_a = (40000000 * skim_batch_total) // TOTAL_LUNA
@@ -509,7 +520,7 @@ class VerifyTest(unittest.TestCase):
             shares = db.cycle_shares(cycle["id"])
             self.assertTrue(all(
                 s["reason"]
-                == "distribution does not match cycle rewards (possible skim)"
+                == "rewards withheld: undistributed balance above 0 batch(es) of income (possible skim)"
                 for s in shares
             ))
         finally:
@@ -518,8 +529,10 @@ class VerifyTest(unittest.TestCase):
 
     def test_drift_and_skim_both_detected(self):
         # When both drift (internal sum discrepancy) and skim (batch sum far
-        # from coinbase) fire, shares get the combined reason.
+        # from coinbase) fire, shares get the combined reason. Strict carry
+        # limit: single-window skim test (M1).
         fake, db, cfg, jobs = base_env()
+        cfg.carry_max_batches = 0
         try:
             skim_batch_total = 1700000
             s_a = (40000000 * skim_batch_total) // TOTAL_LUNA
@@ -551,7 +564,7 @@ class VerifyTest(unittest.TestCase):
             shares = db.cycle_shares(cycle["id"])
             expected_reason = (
                 "unaccounted restake value (possible timing drift); "
-                "distribution does not match cycle rewards (possible skim)"
+                "rewards withheld: undistributed balance above 0 batch(es) of income (possible skim)"
             )
             self.assertTrue(all(s["reason"] == expected_reason for s in shares))
         finally:
@@ -735,19 +748,21 @@ class VerifyTest(unittest.TestCase):
             run_pass(jobs)
 
             cycles = closed_cycle(db)
-            # Catch-up close: the split burst's pieces each form their own
-            # sub-60-block window, and every window is explicitly closed
-            # (SKIPPED) instead of silently riding as the next cycle's opener.
-            self.assertEqual(len(cycles), 3)
-            # Newest first: two skipped slices, then the verified funding cycle.
-            skipped, skipped2, funded = cycles[0], cycles[1], cycles[2]
+            # Catch-up close. M1: the 1,000-luna piece at 113 is within the
+            # carry dust allowance, so it is a normal window that waits for
+            # its close snapshot; when tx-114 lands it joins the same batch
+            # and the whole split burst (102, 114] closes as ONE sub-60-block
+            # slice. The carried balance (0) cannot fund its 501,000 luna, so
+            # it is SKIPPED (pre-M1: two SKIPPED slices).
+            self.assertEqual(len(cycles), 2)
+            skipped, funded = cycles[0], cycles[1]
             self.assertEqual(skipped["status"], "SKIPPED")
             # A coinbase cannot fit inside a sub-60-block slice.
             self.assertEqual(skipped["available_luna"], 0)
             self.assertLess(
                 skipped["closed_block"] - skipped["opened_block"], 60
             )
-            self.assertEqual(skipped2["status"], "SKIPPED")
+            self.assertEqual(skipped["closed_block"], 114)
             self.assertEqual(funded["status"], "VERIFIED")
             self.assertEqual(funded["available_luna"], AVAILABLE)
             self.assertEqual(funded["closed_block"], 102)
@@ -766,8 +781,14 @@ class VerifyTest(unittest.TestCase):
     def test_no_income_full_window_still_mismatch(self):
         # A window >= 60 blocks with payouts but no coinbase is NOT a boundary
         # artifact: the operator paid out money with no earnings in a full
-        # window. That must remain MISMATCH, never SKIPPED.
+        # window. That must remain MISMATCH, never SKIPPED. M1: the verdict
+        # needs a known carry baseline, so a predecessor cycle that closed
+        # with nothing carried is seeded first (without one, the first-ever
+        # cycle only establishes the baseline: see tests/test_carry.py).
         fake, db, cfg, jobs = base_env()
+        seed = db.create_cycle(VALIDATOR, -100, 1, TOTAL_LUNA, 0)
+        db.close_cycle(seed, -50, 2, 0, 0, "VERIFIED", attribution="tx",
+                       carry_luna=0, fee_carry_luna=0)
         try:
             stage_open_close(
                 fake,
@@ -790,9 +811,11 @@ class VerifyTest(unittest.TestCase):
             ])
             run_two_pass(jobs)
 
-            cycles = closed_cycle(db)
+            cycles = [c for c in closed_cycle(db) if c["id"] != seed]
             self.assertEqual(len(cycles), 1)
             self.assertEqual(cycles[0]["status"], "MISMATCH")
+            self.assertIn("payout exceeds rewards earned plus carried balance",
+                          db.cycle_shares(cycles[0]["id"])[0]["reason"])
             self.assertEqual(cycles[0]["available_luna"], 0)
             self.assertGreaterEqual(
                 cycles[0]["closed_block"] - cycles[0]["opened_block"], 60

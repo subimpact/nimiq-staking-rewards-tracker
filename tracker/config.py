@@ -42,6 +42,27 @@ MAX_CLOSE_PER_TICK = 600
 # Upper bound on pages walked per poll when draining pending ingest gaps.
 BACKFILL_PAGES_PER_POLL = 3
 
+# Carry-aware verification (M1, 2026-10-19). The payout engine sweeps its
+# wallet about a minute after a coinbase lands, so a cycle boundary often
+# falls between a reward and the payout that distributes it: one window holds
+# the income, the next holds the payout. The verifier therefore tracks the
+# undistributed balance ("carry") from cycle to cycle:
+#   carry_out = carry_in + owed_to_stakers - paid_out
+# and requires it to stay between -CARRY_DUST_LUNA and
+# CARRY_MAX_BATCHES x (largest recent coinbase) + CARRY_DUST_LUNA.
+# A withheld payout makes the carry grow past the limit; an unexplained
+# payout makes it go negative. 0 batches = every window must pay out its own
+# income (the pre-M1 strict rule).
+CARRY_MAX_BATCHES = 1
+CARRY_DUST_LUNA = 10000
+
+# Under-payment tolerance for a staker's share of a payout, in parts per
+# million of that share (minimum 1 luna for integer flooring). The payout
+# engine's live staker view lags the minute snapshots by a few lunas.
+SHARE_TOLERANCE_PPM = 10
+
+PAYOUT_MODES = ("restake", "transfer", "any")
+
 
 def _get_int(env, name, default):
     raw = env.get(name)
@@ -93,6 +114,24 @@ class Config:
         self.backfill_pages_per_poll = _get_int(
             env, "BACKFILL_PAGES_PER_POLL", BACKFILL_PAGES_PER_POLL
         )
+        self.carry_max_batches = _get_int(env, "CARRY_MAX_BATCHES", CARRY_MAX_BATCHES)
+        self.carry_dust_luna = _get_int(env, "CARRY_DUST_LUNA", CARRY_DUST_LUNA)
+        self.share_tolerance_ppm = _get_int(
+            env, "SHARE_TOLERANCE_PPM", SHARE_TOLERANCE_PPM
+        )
+        # How stakers are paid (M2): "restake" = AddStake to the staking
+        # contract (ImpactZero bot), "transfer" = plain transfer to the
+        # staker's own address, "any" = either. An outbound payment that does
+        # not match the mode is flagged.
+        self.payout_mode = _get_str(env, "PAYOUT_MODE", "restake").lower()
+        if self.payout_mode not in PAYOUT_MODES:
+            raise ValueError("PAYOUT_MODE must be one of %s" % ", ".join(PAYOUT_MODES))
+        # Operator wallets (comma separated). Outbound to these is the
+        # operator withdrawing its fee, checked against what the fee rule
+        # entitles it to, never counted as a staker payout.
+        self.operator_addrs = [
+            a.strip() for a in _get_str(env, "OPERATOR_ADDRS", "").split(",") if a.strip()
+        ]
         self.data_dir = _get_str(env, "DATA_DIR", "/data")
         self.port = _get_int(env, "PORT", 8649)
         self.poll_seconds = _get_int(env, "POLL_SECONDS", 60)
