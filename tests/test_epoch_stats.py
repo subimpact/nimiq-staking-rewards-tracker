@@ -126,6 +126,31 @@ class EpochStatsTest(unittest.TestCase):
         self.assertIsNone(self.row(2))
         self.assertIsNotNone(self.row(3))
 
+    def test_history_floor_stops_older_walks_and_keeps_rewards_whole(self):
+        # Epochs 1 and 2 left partial; the node serves only from mid-epoch 2.
+        # Epoch 2 counts up to... nothing new (its next block is below the
+        # floor), epoch 1 is not walked at all, and both keep their reward
+        # sums over the whole epoch.
+        conn = sqlite3.connect(self.db)
+        conn.execute("CREATE TABLE epoch_stats (validator TEXT, epoch INTEGER, start_block INTEGER, "
+                     "end_block INTEGER, micro_total INTEGER, produced INTEGER, reward_count INTEGER, "
+                     "reward_sum_luna INTEGER, updated_at_ms INTEGER, PRIMARY KEY (validator, epoch))")
+        for ep in (1, 2):
+            st = ep * E + 1
+            conn.execute("INSERT INTO epoch_stats VALUES (?, ?, ?, ?, 5, 0, 0, 0, 0)", (OURS, ep, st, st + 5))
+            conn.execute("INSERT INTO meta VALUES (?, ?)", ("epoch_stats_upto_%d" % ep, str(st + 5)))
+            for b in range(st + 59, st + E, 60):
+                conn.execute("INSERT INTO rewards VALUES (?, ?, 10, 0, 'h')", (OURS, b))
+        conn.commit()
+        conn.close()
+        self.env["FAKE_FLOOR"] = str(2 * E + 1000)
+        self.run_tool(3 * E + 61, "--lookback", "0")
+        for ep in (1, 2):
+            r = self.row(ep)
+            self.assertEqual(r["end_block"], ep * E + 6)
+            self.assertEqual(r["micro_total"], 5)
+            self.assertEqual(r["reward_count"], 720)
+
     def test_budget_bounds_a_run(self):
         start = 3 * E + 1
         out = self.run_tool(start + 600, "--max-batches", "4", "--lookback", "0")

@@ -222,6 +222,19 @@ class CarryTest(unittest.TestCase):
         db.close()
 
 
+class CarryApiTest(unittest.TestCase):
+    def test_cycle_json_exposes_carry(self):
+        from tracker.api import _cycle_json
+        h = Harness()
+        h.seed(0)
+        h.window([COINBASE, COINBASE], split(COINBASE))
+        c = h.close_all()[0]
+        j = _cycle_json(h.db.get_cycle(c["id"]))
+        self.assertGreater(j["carry_luna"], COINBASE - 10)
+        self.assertIn("fee_carry_luna", j)
+        h.db.close()
+
+
 class PayoutModeTest(unittest.TestCase):
     def tearDown(self):
         self.h.db.close()
