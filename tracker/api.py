@@ -388,6 +388,10 @@ def _cycle_json(r):
         "closed_at_ms": r["closed_at_ms"],
         "attribution": (r["attribution"] or "") if "attribution" in keys else "",
         "note": (r["note"] or "") if "note" in keys else "",
+        # Carry rule (M1): undistributed balance after the cycle; null for
+        # cycles closed before M1 and for PENDING ones.
+        "carry_luna": r["carry_luna"] if "carry_luna" in keys else None,
+        "fee_carry_luna": r["fee_carry_luna"] if "fee_carry_luna" in keys else None,
     }
 
 

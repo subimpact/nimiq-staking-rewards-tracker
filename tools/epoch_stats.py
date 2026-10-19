@@ -223,6 +223,10 @@ def main():
     epochs_to_do = [boundary_epoch] + incomplete + [
         ep for ep in missing if ep not in incomplete]
     budget = {"left": args.max_batches}
+    # The node keeps a limited block history (about two epochs on a pruned
+    # full node). Once a closed epoch's next block is unreadable, older
+    # incomplete epochs cannot be walked either: skip their RPC calls this run.
+    history = {"floor_hit": False}
 
     for ep in epochs_to_do:
         if budget["left"] <= 0:
@@ -248,7 +252,7 @@ def main():
         walk_from = int(upto_row["v"]) + 1 if upto_row and upto_row["v"] is not None else ep_start
         counted_to = walk_from - 1
 
-        if walk_from <= ep_end:
+        if walk_from <= ep_end and not (history["floor_hit"] and ep != boundary_epoch):
             # Walk [walk_from, ep_end] one batched RPC (<= 60 heights) at a
             # time. Heights continue exactly after the last counted block, so
             # a resumed walk never double-counts or skips a block.
@@ -280,6 +284,8 @@ def main():
                             produced += 1
                     counted_to = h
                 if len(heights) != batch_end - h0 + 1:
+                    if ep != boundary_epoch:
+                        history["floor_hit"] = True
                     break
                 h0 = batch_end + 1
             if h0 <= ep_end and budget["left"] <= 0:
@@ -301,11 +307,14 @@ def main():
                   % ep)
             continue
 
-        # Reward income in the same window from the rewards table.
+        # Reward income over the WHOLE epoch (so far): the rewards table has
+        # full history even where the node's block history ends, so this
+        # column is complete even when produced/slots are partial.
+        rw_end = head if ep == boundary_epoch else ep_start + EPOCH_BLOCKS - 1
         rw = conn.execute(
             "SELECT COUNT(*) AS n, COALESCE(SUM(amount_luna), 0) AS s "
             "FROM rewards WHERE block>=? AND block<=?",
-            (ep_start, ep_end),
+            (ep_start, rw_end),
         ).fetchone()
 
         conn.execute(
