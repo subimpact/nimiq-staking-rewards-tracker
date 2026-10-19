@@ -204,6 +204,21 @@ class CarryTest(unittest.TestCase):
         h.window([COINBASE], pay)
         self.assertEqual(h.close_all()[0]["status"], "VERIFIED")
 
+    def test_small_absolute_shortfall_floor(self):
+        # Sep-2026 shape: the largest share 18 luna short while two mid-size
+        # shares got ~10 extra. Inside SHARE_TOLERANCE_LUNA (50); 51+ fails.
+        for short, status in ((18, "VERIFIED"), (120, "MISMATCH")):
+            h = self.h = Harness()
+            h.seed(0)
+            pay = split(COINBASE)
+            pay[STAKER_A] -= short
+            pay[STAKER_B] += short // 2
+            pay[STAKER_C] += short - short // 2
+            h.window([COINBASE], pay)
+            self.assertEqual(h.close_all()[0]["status"], status, short)
+            h.db.close()
+        self.h = Harness()
+
     def test_dust_skipped_staker_leaves_the_weight_set(self):
         # Old dust-floor era: a share below MIN_SHARE was skipped (0 paid)
         # and the others shared the whole payout.

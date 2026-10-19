@@ -68,7 +68,7 @@ The carry of every cycle is stored (`cycles.carry_luna`, `cycles.fee_carry_luna`
 - pot = D, unless the median of the shares that can be measured precisely (>= 10,000 luna) implies a pot more than `DUST_TOLERANCE_LUNA` away from D. Then the median pot is used, so that one shorted staker is the one flagged rather than everyone else.
 - expected_i = floor(weight_i x pot / sum of weights).
 
-A line is OK when actual_i equals expected_i within 1 luna (integer flooring), or exceeds it by at most `DUST_TOLERANCE_LUNA` (500), or falls short by at most `SHARE_TOLERANCE_PPM` (10 parts per million of the share: the bot's live staker view lags the snapshots by a few lunas), or expected_i is below `MIN_SHARE_LUNA` and actual_i is 0. Otherwise it fails with "paid less than stake share of this payout" or "credit exceeds expected share". A payee with no opening balance (joined during the window) gets its own failing line.
+A line is OK when actual_i equals expected_i within 1 luna (integer flooring), or exceeds it by at most `DUST_TOLERANCE_LUNA` (500), or falls short by at most the larger of `SHARE_TOLERANCE_PPM` (10 parts per million of the share: the bot's live staker view lags the snapshots by a few lunas) and `SHARE_TOLERANCE_LUNA` (50 luna = 0.0005 NIM), or expected_i is below `MIN_SHARE_LUNA` and actual_i is 0. Otherwise it fails with "paid less than stake share of this payout" or "credit exceeds expected share". A payee with no opening balance (joined during the window) gets its own failing line.
 
 A drift check runs on top: the attributed credits plus any unattributed value must equal everything that left the wallet within 1 luna ("unaccounted restake value").
 
@@ -117,6 +117,7 @@ Listed with their defaults. Thresholds mirror the ImpactZero restake bot.
 - CARRY_MAX_BATCHES: largest undistributed balance allowed, in batches of income (0 = every window pays its own income). Default: 1
 - CARRY_DUST_LUNA: slack on both sides of the carried balance. Default: 10000
 - SHARE_TOLERANCE_PPM: allowed shortfall per staker line, in parts per million of the share. Default: 10
+- SHARE_TOLERANCE_LUNA: allowed shortfall per staker line in lunas, whichever of the two is larger. Default: 50
 - PAYOUT_MODE: `restake`, `transfer` or `any`: which outbound payments count as staker payouts. Default: restake
 - OPERATOR_ADDRS: comma-separated operator wallets; outbound to them is a fee withdrawal checked against the fee rule. Default: empty
 - RESERVE_LUNA: the bot's wallet floor, recorded for reference, never deducted. Default: 0

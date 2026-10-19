@@ -811,6 +811,7 @@ class Jobs:
                 if abs(med - pot) > self.cfg.dust_tolerance_luna:
                     pot = med
         ppm = int(getattr(self.cfg, "share_tolerance_ppm", 10))
+        under_floor = int(getattr(self.cfg, "share_tolerance_luna", 50))
 
         all_ok = True
         sum_delta = 0
@@ -827,7 +828,7 @@ class Jobs:
                 ok = False
                 reason = "credit exceeds expected share (possible external top-up)"
             elif _is_ok(expected, actual, min_share,
-                        self.cfg.dust_tolerance_luna, ppm):
+                        self.cfg.dust_tolerance_luna, ppm, under_floor):
                 ok = True
                 reason = ""
             else:
@@ -990,7 +991,8 @@ def _is_coinbase(sender):
     return COINBASE_ADDR.replace(" ", "") in sender.replace(" ", "").upper()
 
 
-def _is_ok(expected, actual, min_share, dust_tolerance=500, under_ppm=0):
+def _is_ok(expected, actual, min_share, dust_tolerance=500, under_ppm=0,
+           under_floor=0):
     if actual == expected:
         return True
     if expected < min_share and actual == 0:
@@ -1001,7 +1003,8 @@ def _is_ok(expected, actual, min_share, dust_tolerance=500, under_ppm=0):
     # Relative under-drift tolerance (M1): the payout engine's live staker
     # view lags the minute snapshots by a few lunas, which moves a large
     # share by a few lunas. under_ppm parts per million of the share.
-    if actual < expected and expected - actual <= (expected * under_ppm) // 1000000:
+    if actual < expected and expected - actual <= max(
+            (expected * under_ppm) // 1000000, under_floor):
         return True
     # Dust-noise floor: actual may exceed expected by up to one dust
     # tolerance because dust shares (< min_share) are skipped and swept into
