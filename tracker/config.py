@@ -60,6 +60,11 @@ CARRY_DUST_LUNA = 10000
 # million of that share (minimum 1 luna for integer flooring). The payout
 # engine's live staker view lags the minute snapshots by a few lunas.
 SHARE_TOLERANCE_PPM = 10
+# ...and never less than this many lunas (0.0005 NIM). The Sep-2026 bot
+# version split a few dozen lunas differently between stakers; withheld
+# totals are caught by the carry check, so this only bounds redistribution
+# between stakers, alongside the 500-luna DUST_TOLERANCE_LUNA upper band.
+SHARE_TOLERANCE_LUNA = 50
 
 PAYOUT_MODES = ("restake", "transfer", "any")
 
@@ -118,6 +123,9 @@ class Config:
         self.carry_dust_luna = _get_int(env, "CARRY_DUST_LUNA", CARRY_DUST_LUNA)
         self.share_tolerance_ppm = _get_int(
             env, "SHARE_TOLERANCE_PPM", SHARE_TOLERANCE_PPM
+        )
+        self.share_tolerance_luna = _get_int(
+            env, "SHARE_TOLERANCE_LUNA", SHARE_TOLERANCE_LUNA
         )
         # How stakers are paid (M2): "restake" = AddStake to the staking
         # contract (ImpactZero bot), "transfer" = plain transfer to the
