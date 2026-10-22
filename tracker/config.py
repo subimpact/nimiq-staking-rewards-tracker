@@ -66,6 +66,20 @@ SHARE_TOLERANCE_PPM = 10
 # between stakers, alongside the 500-luna DUST_TOLERANCE_LUNA upper band.
 SHARE_TOLERANCE_LUNA = 50
 
+# Opt-in election weighting (payout basis "Option 1"). When ELECTION_FROM_EPOCH
+# is above 0, every cycle whose epoch (from its opened_block) is >= this value
+# weights each staker by min(stake of the staker in the epoch-start snapshot,
+# the staker's live balance at cycle open): a mid-epoch joiner earns nothing
+# until the next epoch and a mid-epoch top-up earns only on its epoch-start
+# balance. Epoch math: epoch = (block - 1) // 43200 - 79. Cycles in earlier
+# epochs keep the open-balance weights so re-deriving history stays correct.
+# 0 = disabled (open-balance weights everywhere).
+ELECTION_FROM_EPOCH = 0
+# A staker's epoch-start balance is the first staker snapshot this close to the
+# epoch's first reward/restake timestamp (defaults to 15 min; the bot takes its
+# epoch-start snapshot within ~60 s of the boundary).
+ELECTION_SNAPSHOT_WINDOW_MS = 900000
+
 PAYOUT_MODES = ("restake", "transfer", "any")
 
 
@@ -126,6 +140,13 @@ class Config:
         )
         self.share_tolerance_luna = _get_int(
             env, "SHARE_TOLERANCE_LUNA", SHARE_TOLERANCE_LUNA
+        )
+        # Opt-in election weighting (payout basis "Option 1", see above).
+        self.election_from_epoch = _get_int(
+            env, "ELECTION_FROM_EPOCH", ELECTION_FROM_EPOCH
+        )
+        self.election_snapshot_window_ms = _get_int(
+            env, "ELECTION_SNAPSHOT_WINDOW_MS", ELECTION_SNAPSHOT_WINDOW_MS
         )
         # How stakers are paid (M2): "restake" = AddStake to the staking
         # contract (ImpactZero bot), "transfer" = plain transfer to the
