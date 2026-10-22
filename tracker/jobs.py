@@ -214,59 +214,48 @@ class Jobs:
 
     # ------------------------------------------------- election weighting
 
-    def _epoch_start_balances(self, epoch):
-        """Memoized election-weight balance map for one epoch: staker address
-        -> epoch-start balance, or None when the epoch-start data is
-        unavailable. A staker ABSENT from the map (the ladder has rows but
-        the staker does not) was not present at epoch start -> weight 0."""
+    # Sentinel: epoch-start data not observable yet at the live head; the
+    # close waits (stays PENDING) for the next snapshot poll.
+    ELECTION_WAIT = object()
+
+    def _epoch_start_balances(self, epoch, allow_fallback):
+        """Election-weight balance map for one epoch: staker address ->
+        balance in the first snapshot poll after the epoch's start. A staker
+        absent from that poll was not staked at epoch start -> weight 0.
+
+        Only that definitive answer is memoized. When no poll exists after the
+        epoch start yet: at the live head (allow_fallback False) return
+        ELECTION_WAIT so the close retries next tick; for history (a later
+        batch exists, so no newer poll will ever arrive for this window) use
+        the last poll before the start, else None (= unavailable, SKIPPED).
+        Neither the fallback nor None is cached, so a transient gap never
+        pins a whole epoch to SKIPPED."""
         if epoch in self._election_bal_cache:
             return self._election_bal_cache[epoch]
-        result = self._compute_epoch_start_balances(epoch)
-        self._election_bal_cache[epoch] = result
-        return result
-
-    def _compute_epoch_start_balances(self, epoch):
         validator = self.cfg.validator_addr
         # Epoch math used by the restake bot: first block of epoch E =
-        # (E + 79) * 43200 + 1.
+        # (E + 79) * 43200 + 1. Epoch-start time = first reward (else first
+        # restake) stored inside the epoch's block range.
         start_block = (epoch + 79) * 43200 + 1
         end_block = (epoch + 80) * 43200 + 1
-        # Epoch-start time: the bot takes its snapshot in the first cycle
-        # after the epoch's first block, before its payouts, so anchor on the
-        # first reward (else first restake) inside the epoch's block range.
         start_ms = self.db.first_reward_ts_in_range(validator, start_block, end_block)
         if start_ms is None:
             start_ms = self.db.first_restake_ts_in_range(
                 validator, start_block, end_block)
         if start_ms is None:
-            return None
+            return None if allow_fallback else self.ELECTION_WAIT
         window = int(getattr(self.cfg, "election_snapshot_window_ms", 900000) or 900000)
-        return self._snapshot_ladder_state(validator, start_ms, window)
-
-    def _snapshot_ladder_state(self, validator, start_ms, window):
-        """Epoch-start balances from the snapshot ladder: the first row per
-        staker in [start_ms, start_ms + window). When the ladder has no row
-        in that window but rows exist in [start_ms - window, start_ms), fall
-        back to the last row per staker there (the ladder polled just before
-        the boundary). Absence from the returned map while the map's ladder
-        window had any row means the staker joined later -> balance 0."""
-        rows = self.db.staker_snapshot_rows_between(
-            validator, start_ms, start_ms + window)
+        rows = self.db.staker_poll_rows(validator, start_ms, start_ms + window)
         if rows:
-            first = {}
-            for r in rows:
-                addr = r["address"]
-                if addr not in first:
-                    first[addr] = int(r["balance_luna"])
-            return first
-        rows = self.db.staker_snapshot_rows_between(
-            validator, start_ms - window, start_ms)
+            result = {r["address"]: int(r["balance_luna"]) for r in rows}
+            self._election_bal_cache[epoch] = result
+            return result
+        if not allow_fallback:
+            return self.ELECTION_WAIT
+        rows = self.db.staker_poll_rows(validator, start_ms - window, start_ms, last=True)
         if not rows:
             return None
-        last = {}
-        for r in rows:
-            last[r["address"]] = int(r["balance_luna"])
-        return last
+        return {r["address"]: int(r["balance_luna"]) for r in rows}
 
     def _latest_validator_total(self):
         row = self.db.latest_validator_snapshot(self.cfg.validator_addr)
@@ -843,7 +832,10 @@ class Jobs:
         if election_from > 0:
             epoch = (opened_block - 1) // 43200 - 79
             if epoch >= election_from:
-                epoch_bal = self._epoch_start_balances(epoch)
+                epoch_bal = self._epoch_start_balances(
+                    epoch, allow_fallback=close_bound_ms is not None)
+                if epoch_bal is self.ELECTION_WAIT:
+                    return        # wait for the epoch-start poll (stays PENDING)
                 if epoch_bal is None:
                     _close_skipped(
                         "election weights unavailable (no staker snapshot "

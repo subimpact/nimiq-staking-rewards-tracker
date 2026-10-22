@@ -264,14 +264,14 @@ class ElectionTest(unittest.TestCase):
         # not per cycle.
         h = self.h = ElectionHarness(ELECTION_FROM_EPOCH=EPOCH)
         h.ladder(BAL)
-        orig = h.db.staker_snapshot_rows_between
+        orig = h.db.staker_poll_rows
         calls = {"n": 0}
 
         def wrapped(*a, **k):
             calls["n"] += 1
             return orig(*a, **k)
 
-        h.db.staker_snapshot_rows_between = wrapped
+        h.db.staker_poll_rows = wrapped
         h.window([COINBASE], split(COINBASE, BAL))
         first = h.close_all()[0]
         self.assertEqual(first["status"], "VERIFIED")
@@ -283,6 +283,47 @@ class ElectionTest(unittest.TestCase):
         self.assertEqual(second["status"], "VERIFIED")
         self.assertEqual(calls["n"], after_one)
         self.assertEqual(h.jobs._election_bal_cache[EPOCH], dict(BAL))
+
+    # g (orchestrator review) ----------------------------------------------
+
+    def test_joiner_in_later_poll_inside_window_is_not_elected(self):
+        # B first appears in a poll 5 min after the epoch-start poll, still
+        # inside the 15-min window. Only the FIRST poll is the epoch-start
+        # state, so B must weigh 0 and a split that pays B nothing VERIFIES.
+        h = self.h = ElectionHarness(ELECTION_FROM_EPOCH=EPOCH)
+        h.ladder({STAKER_A: BAL[STAKER_A], STAKER_C: BAL[STAKER_C]})
+        h.ladder({STAKER_A: BAL[STAKER_A], STAKER_B: 60000000000,
+                  STAKER_C: BAL[STAKER_C]}, t=EPOCH_LADDER_MS + 300000)
+        pot = split(COINBASE, {STAKER_A: BAL[STAKER_A], STAKER_C: BAL[STAKER_C]})
+        h.window([COINBASE], pot)
+        cyc = h.close_all()[0]
+        self.assertEqual(cyc["status"], "VERIFIED")
+        self.assertEqual(h.shares(cyc)[STAKER_B]["expected_luna"], 0)
+
+    def test_live_head_waits_and_transient_gaps_are_not_cached(self):
+        # At the live head with no poll after the epoch start yet, the close
+        # waits; neither the wait nor an unavailable answer is memoized, so
+        # the first definitive poll is used as soon as it exists.
+        h = self.h = ElectionHarness(ELECTION_FROM_EPOCH=EPOCH)
+        h.db.upsert_reward(VALIDATOR, EPOCH_FIRST_BLOCK + 60, COINBASE,
+                           EPOCH_ANCHOR_MS, "cb-anchor")
+        j = h.jobs
+        self.assertIs(j._epoch_start_balances(EPOCH, allow_fallback=False),
+                      j.ELECTION_WAIT)
+        self.assertIsNone(j._epoch_start_balances(EPOCH, allow_fallback=True))
+        self.assertNotIn(EPOCH, j._election_bal_cache)
+        # A pre-start poll is only a history fallback, never cached.
+        h.ladder({STAKER_A: BAL[STAKER_A]}, t=EPOCH_ANCHOR_MS - 1000)
+        self.assertIs(j._epoch_start_balances(EPOCH, allow_fallback=False),
+                      j.ELECTION_WAIT)
+        self.assertEqual(j._epoch_start_balances(EPOCH, allow_fallback=True),
+                         {STAKER_A: BAL[STAKER_A]})
+        self.assertNotIn(EPOCH, j._election_bal_cache)
+        # The first post-start poll is definitive and memoized.
+        h.ladder(BAL)
+        self.assertEqual(j._epoch_start_balances(EPOCH, allow_fallback=False),
+                         dict(BAL))
+        self.assertEqual(j._election_bal_cache[EPOCH], dict(BAL))
 
 
 if __name__ == "__main__":

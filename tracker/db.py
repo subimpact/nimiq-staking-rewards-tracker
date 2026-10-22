@@ -439,16 +439,23 @@ class DB:
         ).fetchone()
         return int(row["ts_ms"]) if row else None
 
-    def staker_snapshot_rows_between(self, validator, from_ms, to_ms_exclusive):
-        """All staker snapshot rows with
-        from_ms <= fetched_at_ms < to_ms_exclusive, ordered by fetched_at_ms
-        ascending (the epoch-start snapshot ladder). Runs once per epoch per
-        close and is memoized on the job; the 15-min window holds only a few
-        hundred rows at minute snapshots."""
-        return self.conn.execute(
-            "SELECT * FROM staker_snapshots WHERE validator=? AND fetched_at_ms>=? "
-            "AND fetched_at_ms<? ORDER BY fetched_at_ms ASC",
+    def staker_poll_rows(self, validator, from_ms, to_ms_exclusive, last=False):
+        """Rows of ONE snapshot poll inside [from_ms, to_ms_exclusive): the
+        earliest poll (or the latest with last=True). Every poll writes all
+        its staker rows with one shared fetched_at_ms, so a single poll is the
+        ladder state at that moment; a staker who first appears in a LATER
+        poll of the window joined after it. [] when the window has no poll."""
+        agg = "MAX" if last else "MIN"
+        row = self.conn.execute(
+            "SELECT %s(fetched_at_ms) AS t FROM staker_snapshots WHERE validator=? "
+            "AND fetched_at_ms>=? AND fetched_at_ms<?" % agg,
             (validator, from_ms, to_ms_exclusive),
+        ).fetchone()
+        if row is None or row["t"] is None:
+            return []
+        return self.conn.execute(
+            "SELECT * FROM staker_snapshots WHERE validator=? AND fetched_at_ms=?",
+            (validator, int(row["t"])),
         ).fetchall()
 
     def latest_staker_rows(self, validator):
