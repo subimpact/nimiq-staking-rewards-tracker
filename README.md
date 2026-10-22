@@ -127,6 +127,8 @@ Listed with their defaults. Thresholds mirror the ImpactZero restake bot.
 - VALIDATOR_FEE_PPM: the operator's fee in parts per million of window income (50000 = 5%). Default: 0
 - DENOMINATOR_MODE: `stakers` (deposit slice paid to stakers) or `total` (deposit slice kept by the operator). Default: stakers
 - SNAPSHOT_RETENTION_DAYS: when above 0, staker snapshots older than this many days are thinned to one per staker per hour, once a day. Cycles older than the cutoff then cannot be re-derived at minute precision. Default: 0 (keep everything)
+- ELECTION_FROM_EPOCH: when above 0, cycles in epochs >= this value weight each staker by min(stake in the epoch-start snapshot, live balance at cycle open): a staker who joined (or topped up) mid-epoch earns only on their epoch-start balance until the next epoch, and a deactivation still stops earning at once. Earlier epochs keep open-balance weights so re-deriving history stays correct. Default: 0 (off)
+- ELECTION_SNAPSHOT_WINDOW_MS: how close to the epoch-start anchor a staker snapshot must be to count as the epoch-start balance. Default: 900000 (15 min)
 - DATA_DIR: directory for tracker.db. Default: /data
 - PORT: API port inside the container. Default: 8649
 - POLL_SECONDS: scheduler interval. Default: 60

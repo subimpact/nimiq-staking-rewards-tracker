@@ -207,6 +207,66 @@ class Jobs:
         # snapshots never share a millisecond (same-ms timestamps made the
         # strict-after snapshot lookup flaky).
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
+        # Election weighting: per-epoch epoch-start balance maps, memoized so
+        # a history drain does not repeat the snapshot-ladder queries per
+        # cycle of the same epoch. Value None = epoch-start data unavailable.
+        self._election_bal_cache = {}
+
+    # ------------------------------------------------- election weighting
+
+    def _epoch_start_balances(self, epoch):
+        """Memoized election-weight balance map for one epoch: staker address
+        -> epoch-start balance, or None when the epoch-start data is
+        unavailable. A staker ABSENT from the map (the ladder has rows but
+        the staker does not) was not present at epoch start -> weight 0."""
+        if epoch in self._election_bal_cache:
+            return self._election_bal_cache[epoch]
+        result = self._compute_epoch_start_balances(epoch)
+        self._election_bal_cache[epoch] = result
+        return result
+
+    def _compute_epoch_start_balances(self, epoch):
+        validator = self.cfg.validator_addr
+        # Epoch math used by the restake bot: first block of epoch E =
+        # (E + 79) * 43200 + 1.
+        start_block = (epoch + 79) * 43200 + 1
+        end_block = (epoch + 80) * 43200 + 1
+        # Epoch-start time: the bot takes its snapshot in the first cycle
+        # after the epoch's first block, before its payouts, so anchor on the
+        # first reward (else first restake) inside the epoch's block range.
+        start_ms = self.db.first_reward_ts_in_range(validator, start_block, end_block)
+        if start_ms is None:
+            start_ms = self.db.first_restake_ts_in_range(
+                validator, start_block, end_block)
+        if start_ms is None:
+            return None
+        window = int(getattr(self.cfg, "election_snapshot_window_ms", 900000) or 900000)
+        return self._snapshot_ladder_state(validator, start_ms, window)
+
+    def _snapshot_ladder_state(self, validator, start_ms, window):
+        """Epoch-start balances from the snapshot ladder: the first row per
+        staker in [start_ms, start_ms + window). When the ladder has no row
+        in that window but rows exist in [start_ms - window, start_ms), fall
+        back to the last row per staker there (the ladder polled just before
+        the boundary). Absence from the returned map while the map's ladder
+        window had any row means the staker joined later -> balance 0."""
+        rows = self.db.staker_snapshot_rows_between(
+            validator, start_ms, start_ms + window)
+        if rows:
+            first = {}
+            for r in rows:
+                addr = r["address"]
+                if addr not in first:
+                    first[addr] = int(r["balance_luna"])
+            return first
+        rows = self.db.staker_snapshot_rows_between(
+            validator, start_ms - window, start_ms)
+        if not rows:
+            return None
+        last = {}
+        for r in rows:
+            last[r["address"]] = int(r["balance_luna"])
+        return last
 
     def _latest_validator_total(self):
         row = self.db.latest_validator_snapshot(self.cfg.validator_addr)
@@ -773,6 +833,24 @@ class Jobs:
         # the weight set together with whatever they received.
         weighted = {a for a in open_addrs if a not in reason_map}
         weights = {a: (open_bal_map.get(a) or 0) for a in weighted}
+        # Election weighting (when enabled for this epoch): weight =
+        # min(epoch-start stake, open balance). A joiner absent from the
+        # epoch-start snapshot earns 0 this epoch; a top-up earns only on the
+        # epoch-start balance; a deactivation keeps weight 0 via the open
+        # balance. Unavailable epoch-start data closes the cycle SKIPPED
+        # (never guessed with open balances).
+        election_from = int(getattr(self.cfg, "election_from_epoch", 0) or 0)
+        if election_from > 0:
+            epoch = (opened_block - 1) // 43200 - 79
+            if epoch >= election_from:
+                epoch_bal = self._epoch_start_balances(epoch)
+                if epoch_bal is None:
+                    _close_skipped(
+                        "election weights unavailable (no staker snapshot "
+                        "near epoch start)")
+                    return
+                for a in weighted:
+                    weights[a] = min(epoch_bal.get(a) or 0, weights[a])
         D = sum(max(actual_map[a], 0) for a in weighted)
         S = sum(weights.values())
         min_share = self.cfg.min_share_luna

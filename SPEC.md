@@ -17,7 +17,7 @@ Reference deployment: ImpactZero (NQ08 ACT8 T0FE PTG8 P5RL H2S3 QGXH V15R NVXY),
   - `RPC_URL` (default `https://rpc.nimiqwatch.com`): `getTransactionsByAddress` on the reward address, params `[address, 200, cursor_hash]`, newest first.
   - `STAKERS_URL_TEMPLATE`: staker records (`{data: [{address, balance, inactiveBalance, ...}]}`).
   - `VALIDATORS_URL_TEMPLATE`: validator list; the row whose address matches `VALIDATOR_ADDR` is used, and no validator snapshot is written if it is absent.
-- Thresholds mirror the ImpactZero restake bot: `MIN_SHARE_LUNA=500`, `DUST_TOLERANCE_LUNA=500`, `RESERVE_LUNA=0` (informational, never deducted), `BATCH_GAP_BLOCKS=10`. Distribution rule: `VALIDATOR_FEE_PPM=0`, `DENOMINATOR_MODE=stakers`, `PAYOUT_MODE=restake`, `OPERATOR_ADDRS` empty. Carry rule (M1): `CARRY_MAX_BATCHES=1`, `CARRY_DUST_LUNA=10000`, `SHARE_TOLERANCE_PPM=10`, `SHARE_TOLERANCE_LUNA=50`; see README "Check 1: the carried balance". Retention: `SNAPSHOT_RETENTION_DAYS=0` (off).
+- Thresholds mirror the ImpactZero restake bot: `MIN_SHARE_LUNA=500`, `DUST_TOLERANCE_LUNA=500`, `RESERVE_LUNA=0` (informational, never deducted), `BATCH_GAP_BLOCKS=10`. Distribution rule: `VALIDATOR_FEE_PPM=0`, `DENOMINATOR_MODE=stakers`, `PAYOUT_MODE=restake`, `OPERATOR_ADDRS` empty. Carry rule (M1): `CARRY_MAX_BATCHES=1`, `CARRY_DUST_LUNA=10000`, `SHARE_TOLERANCE_PPM=10`, `SHARE_TOLERANCE_LUNA=50`; see README "Check 1: the carried balance". Retention: `SNAPSHOT_RETENTION_DAYS=0` (off). Election weighting (opt-in): `ELECTION_FROM_EPOCH=0` (off), `ELECTION_SNAPSHOT_WINDOW_MS=900000`.
 
 ## SQLite schema
 

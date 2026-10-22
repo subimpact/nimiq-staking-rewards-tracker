@@ -415,6 +415,42 @@ class DB:
             ).fetchall()
         return {r["address"] for r in rows}
 
+    # ---- election weighting (epoch-start snapshot ladder) ----
+
+    def first_reward_ts_in_range(self, validator, start_block, end_block_exclusive):
+        """Timestamp of the earliest rewards row with
+        start_block <= block < end_block_exclusive, or None. Anchors the
+        epoch-start time for election weighting."""
+        row = self.conn.execute(
+            "SELECT ts_ms FROM rewards WHERE validator=? AND block>=? AND block<? "
+            "AND ts_ms IS NOT NULL ORDER BY block ASC LIMIT 1",
+            (validator, start_block, end_block_exclusive),
+        ).fetchone()
+        return int(row["ts_ms"]) if row else None
+
+    def first_restake_ts_in_range(self, validator, start_block, end_block_exclusive):
+        """Timestamp of the earliest restake_txs row with
+        start_block <= block < end_block_exclusive, or None. Fallback epoch
+        start anchor when the epoch's first reward is not stored."""
+        row = self.conn.execute(
+            "SELECT ts_ms FROM restake_txs WHERE validator=? AND block>=? AND block<? "
+            "AND ts_ms IS NOT NULL ORDER BY block ASC LIMIT 1",
+            (validator, start_block, end_block_exclusive),
+        ).fetchone()
+        return int(row["ts_ms"]) if row else None
+
+    def staker_snapshot_rows_between(self, validator, from_ms, to_ms_exclusive):
+        """All staker snapshot rows with
+        from_ms <= fetched_at_ms < to_ms_exclusive, ordered by fetched_at_ms
+        ascending (the epoch-start snapshot ladder). Runs once per epoch per
+        close and is memoized on the job; the 15-min window holds only a few
+        hundred rows at minute snapshots."""
+        return self.conn.execute(
+            "SELECT * FROM staker_snapshots WHERE validator=? AND fetched_at_ms>=? "
+            "AND fetched_at_ms<? ORDER BY fetched_at_ms ASC",
+            (validator, from_ms, to_ms_exclusive),
+        ).fetchall()
+
     def latest_staker_rows(self, validator):
         """Latest snapshot per staker address, ordered by balance desc."""
         rows = self.conn.execute(
