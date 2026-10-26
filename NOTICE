@@ -4,5 +4,7 @@ Copyright (c) 2026 subimpact network
 Licensed under the GNU Affero General Public License v3.0 only (AGPL-3.0-only).
 See LICENSE for the full text.
 
-Versions up to and including commit 31bb7a8 were released under the MIT License
+Versions up to and including commit 6ab6cf1 (dated 2026-10-06, "perf(db): index
+staker_snapshots ...", formerly 31bb7a8 before a 2026-10-26 author-metadata rewrite
+that left file contents unchanged) were released under the MIT License
 (Copyright (c) 2026 subimpact / ImpactZero) and remain available under those terms.
